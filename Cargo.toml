@@ -1,0 +1,142 @@
+[package]
+name = "palisade-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
+license = "Apache-2.0"
+description = "Security-conscious configuration management for honeypot systems with cryptographic tag derivation"
+repository = "https://github.com/Guivernoir/palisade-config"
+documentation = "https://docs.rs/palisade-config"
+keywords = [
+    "honeypot",
+    "security",
+    "configuration",
+    "deception",
+    "cryptography",
+]
+categories = ["config", "cryptography", "authentication"]
+readme = "README.md"
+
+[dependencies]
+# Palisade ecosystem
+palisade_errors = { version = "0.2.1", features = ["obfuscate_codes"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Cryptography
+sha3 = "0.10"
+hex = "0.4"
+rand = "0.8"
+zeroize = { version = "1.7", features = ["derive"] }
+
+# System info
+hostname = "0.4"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Platform detection
+cfg-if = "1.0"
+libc = "0.2.180"
+
+[dev-dependencies]
+# Testing
+proptest = "1.4"
+tempfile = "3.8"
+criterion = { version = "0.8.1", features = ["html_reports"] }
+serde_json = "1.0"
+
+[features]
+default = []
+# Enable detailed debug output (NEVER in production)
+trusted_debug = ["palisade_errors/trusted_debug"]
+# Enable async timing normalization support
+tokio = ["palisade_errors/tokio"]
+async_std = ["palisade_errors/async_std"]
+# Error code obfuscation for paranoid deployments
+obfuscate_codes = ["palisade_errors/obfuscate_codes"]
+
+# ============================================================================
+# EXAMPLES
+# ============================================================================
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "tag_derivation"
+path = "examples/tag_derivation.rs"
+
+[[example]]
+name = "policy_hot_reload"
+path = "examples/policy_hot_reload.rs"
+
+[[example]]
+name = "comprehensive_validation"
+path = "examples/comprehensive_validation.rs"
+
+[[example]]
+name = "change_tracking"
+path = "examples/change_tracking.rs"
+
+[[example]]
+name = "production_deployment"
+path = "examples/production_deployment.rs"
+
+# ============================================================================
+# BENCHMARKS
+# ============================================================================
+
+[[bench]]
+name = "config_benches"
+harness = false
+
+[[bench]]
+name = "tag_derivation"
+harness = false
+
+[[bench]]
+name = "validation"
+harness = false
+
+[[bench]]
+name = "policy_checks"
+harness = false
+
+# ============================================================================
+# TESTS
+# ============================================================================
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "security"
+path = "tests/security.rs"
+
+[[test]]
+name = "proptest_suite"
+path = "tests/proptest.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# ============================================================================
+# PROFILE CONFIGURATIONS
+# ============================================================================
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[profile.test]
+opt-level = 2
