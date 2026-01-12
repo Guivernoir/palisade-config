@@ -561,9 +561,12 @@ mod tests {
     fn test_custom_condition_validation() {
         let mut policy = PolicyConfig::default();
 
-        // Add rule with unregistered custom condition
+        // Remove existing Medium rule to avoid duplicate severity
+        policy.response.rules.retain(|r| r.severity != Severity::Medium);
+
+        // Add rule with unregistered custom condition (using Medium severity)
         policy.response.rules.push(ResponseRule {
-            severity: Severity::Low,
+            severity: Severity::Medium,
             conditions: vec![ResponseCondition::Custom {
                 name: "unregistered".to_string(),
                 params: HashMap::new(),
@@ -571,7 +574,7 @@ mod tests {
             action: ActionType::Log,
         });
 
-        // Should fail validation
+        // Should fail validation (unregistered custom condition)
         assert!(policy.validate().is_err());
 
         // Register the condition

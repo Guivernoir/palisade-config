@@ -932,8 +932,16 @@ mod tests {
 
     #[test]
     fn test_serialization_redacts_secret() {
+        use serde::Serialize;
+        
+        #[derive(Serialize)]
+        struct Wrapper {
+            root_tag: RootTag,
+        }
+        
         let root = RootTag::generate();
-        let serialized = toml::to_string(&root).unwrap();
+        let wrapper = Wrapper { root_tag: root };
+        let serialized = toml::to_string(&wrapper).unwrap();
         assert!(serialized.contains("REDACTED"));
     }
 

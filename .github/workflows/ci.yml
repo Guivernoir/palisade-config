@@ -27,7 +27,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
 
       - name: Cache cargo
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
@@ -143,7 +143,7 @@ jobs:
         run: cargo bench --no-fail-fast
 
       - name: Store benchmark results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
           path: target/criterion/

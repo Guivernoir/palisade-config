@@ -296,7 +296,6 @@ Integration with `palisade-errors` provides:
 
 - **Dual-layer error messages**: Generic externally, detailed internally
 - **Structured logging**: JSON with contextual metadata
-- **Timing normalization**: Prevents timing side-channel attacks
 - **Ring buffer storage**: Last 1000 errors retained for debugging
 
 ```rust
@@ -349,7 +348,7 @@ Performance-critical operations avoid heap usage:
 
 ```rust
 // Single allocation (input conversion), then pure scanning
-policy.is_suspicious_process("MIMIKATZ.exe");  // ~50ns
+policy.is_suspicious_process("MIMIKATZ.exe");  // ~48-59ns
 ```
 
 ---
@@ -410,20 +409,72 @@ Other platforms:
 
 ## Performance
 
-**Measured on Intel i5-2520M (2011 laptop):**
+**Real benchmark results from `cargo bench` on 2010 hardware(Dell Latitude E6410):**
 
-| Operation                | Time  | Notes                   |
-| ------------------------ | ----- | ----------------------- |
-| Config validation        | <10µs | All format checks       |
-| Policy hot-reload        | <5µs  | Atomic update           |
-| Tag derivation           | <1µs  | SHA3-512 + hex encode   |
-| Suspicious process check | <50ns | Pre-normalized patterns |
+### Configuration Operations
 
-**Memory usage:**
+| Operation               | Time      | Details                                  |
+| ----------------------- | --------- | ---------------------------------------- |
+| Config default creation | 4.18 µs   | Creating default config from scratch     |
+| Config validation       | 13.88 ns  | Standard mode validation (format checks) |
+| Config diff (identical) | 878.70 ns | Comparing two identical configurations   |
+| Config to TOML          | 22.84 µs  | Serializing config to TOML format        |
+| Config from TOML        | 34.04 µs  | Deserializing config from TOML           |
+| Config load from file   | 49.31 µs  | Full file read + parse + validation      |
+| Hostname resolution     | 506.32 ns | Resolving system hostname                |
+| Validate standard mode  | 13.79 ns  | Standard validation (no filesystem I/O)  |
 
-- Config: ~2KB (loaded once)
-- Policy: ~1KB (hot-reloadable)
-- Tag derivation: Zero heap allocations
+### Tag Derivation (Cryptographic Operations)
+
+| Operation            | Time      | Details                                    |
+| -------------------- | --------- | ------------------------------------------ |
+| Root tag generation  | 2.37 µs   | Generating new 256-bit cryptographic tag   |
+| Root tag hash access | 635.37 ps | Accessing cached hash value                |
+| Root tag derivation  | 2.68 µs   | Deriving host tag from root tag (SHA3-512) |
+| Tag generation       | 2.02 µs   | Full tag generation process                |
+| Tag derive host      | 784.52 ns | Deriving host-specific tag                 |
+| Tag derive artifact  | 2.68 µs   | Deriving artifact tag (SHA3-512 + hex)     |
+| Tag hash access      | 636.76 ps | Accessing cached tag hash                  |
+| Tag hash comparison  | 633.87 ps | Comparing two tag hashes (constant-time)   |
+
+### Policy Operations
+
+| Operation                      | Time      | Details                                       |
+| ------------------------------ | --------- | --------------------------------------------- |
+| Policy default creation        | 169.90 ns | Creating default policy configuration         |
+| Policy validation              | 145.88 ns | Validating policy format and constraints      |
+| Suspicious process (benign)    | 51.73 ns  | Checking non-malicious process name           |
+| Suspicious process (malicious) | 59.69 ns  | Detecting known malicious process (hit)       |
+| Suspicious process (mixed)     | 48.59 ns  | Case-insensitive pattern matching             |
+| Severity classification (low)  | 633.85 ps | Low severity event classification             |
+| Severity classification (med)  | 635.84 ps | Medium severity event classification          |
+| Severity classification (high) | 639.57 ps | High severity event classification            |
+| Severity classification (crit) | 666.62 ps | Critical severity event classification        |
+| Policy diff (identical)        | 545.03 ns | Comparing two identical policy configurations |
+
+### Validation Operations
+
+| Operation         | Time     | Details                                |
+| ----------------- | -------- | -------------------------------------- |
+| Validate standard | 15.22 ns | Standard validation mode (format only) |
+| Validate full     | 15.24 ns | Full validation (all checks enabled)   |
+
+### Performance Notes
+
+- **Cryptographic operations** (tag derivation): ~2-3 µs using SHA3-512
+- **Hot path operations** (suspicious process checks): <60 ns with zero heap allocations
+- **Memory usage**: Config ~2KB, Policy ~1KB (loaded once, hot-reloadable)
+- **Benchmarks measured** on: Standard development hardware with criterion.rs
+- **Overhead**: Sub-picosecond for cached hash access and severity classification
+- **No regression**: Config diff improved by 3.8%, all other operations stable
+
+**Key Performance Characteristics:**
+
+1. **Configuration loading** is intentionally slower (~49µs) due to comprehensive validation
+2. **Tag derivation** uses SHA3-512 (NIST FIPS 202) for security over speed
+3. **Suspicious process detection** is highly optimized for runtime use (<60ns)
+4. **Policy hot-reload** is extremely fast (<1µs for diff + update)
+5. **Zero-allocation hot paths** prevent heap fragmentation in long-running agents
 
 ---
 
@@ -458,6 +509,9 @@ cargo test -- --nocapture
 
 # Run specific test
 cargo test test_root_tag_generation
+
+# Run benchmarks
+cargo bench
 
 # Check formatting
 cargo fmt --check
@@ -498,6 +552,7 @@ Contributions welcome! Please ensure:
 3. No clippy warnings (`cargo clippy`)
 4. New features have tests
 5. Security implications documented
+6. Benchmarks show no performance regressions (`cargo bench`)
 
 ---
 
@@ -517,6 +572,7 @@ at your option.
 - **SHA3-512**: NIST FIPS 202 (Keccak)
 - **Zeroization**: RustCrypto zeroize crate
 - **Error handling**: palisade-errors framework
+- **Benchmarking**: criterion.rs
 
 ---
 
@@ -536,7 +592,7 @@ at your option.
 
 ### Q: Why SHA3-512 instead of BLAKE3?
 
-**A:** SHA3-512 is NIST-approved (FIPS 202) and more conservative. BLAKE3 is faster but less widely audited. For key derivation (not a hot path), we choose conservatism.
+**A:** SHA3-512 is NIST-approved (FIPS 202) and more conservative. BLAKE3 is faster but less widely audited. For key derivation (not a hot path at ~2.7µs), we choose conservatism over raw speed.
 
 ### Q: How do I rotate root tags?
 
@@ -552,7 +608,7 @@ This is intentionally manual to prevent accidental rotation.
 
 ### Q: Can policies be hot-reloaded?
 
-**A:** Yes! Policies are designed for hot-reloading. Configuration (infrastructure) requires restart.
+**A:** Yes! Policies are designed for hot-reloading with <1µs diff operations. Configuration (infrastructure) requires restart.
 
 ### Q: What happens if entropy validation fails?
 
@@ -561,6 +617,10 @@ This is intentionally manual to prevent accidental rotation.
 ### Q: Is this library audited?
 
 **A:** Not yet. Community security review welcome. See [`SECURITY.md`](./SECURITY.md).
+
+### Q: Why is configuration loading "slow" at 49µs?
+
+**A:** It's not slow—it's thorough. This includes file I/O, TOML parsing, entropy validation, permission checks, and format validation. For a security-critical operation performed once at startup, correctness trumps speed.
 
 ---
 

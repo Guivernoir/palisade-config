@@ -100,11 +100,11 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct AgentConfig {
     /// Unique instance identifier (for correlation)
-    #[serde(skip)]
+    #[serde(skip, default)]
     pub instance_id: ProtectedString,
 
     /// Working directory for agent state
-    #[serde(skip)]
+    #[serde(skip, default)]
     pub work_dir: ProtectedPath,
 
     /// Optional environment label (dev, staging, prod)
@@ -551,6 +551,13 @@ impl Config {
                     .with_metadata("operation", "create_dir_all")
                     .with_obfuscation()
                 })?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o700);
+                    let _ = std::fs::set_permissions(work_dir, perms);
+                }
             }
 
             // Test write permissions

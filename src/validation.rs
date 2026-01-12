@@ -260,12 +260,21 @@ mod tests {
         let changes = config1.diff(&config2);
         assert!(!changes.is_empty());
 
-        if let Some(ConfigChange::PathsChanged { added, removed }) = changes.first() {
-            assert_eq!(added.len(), 1);
-            assert_eq!(removed.len(), 1);
-        } else {
-            panic!("Expected PathsChanged");
-        }
+        // Find the PathsChanged in the changes list
+        let path_change = changes.iter().find_map(|change| {
+            if let ConfigChange::PathsChanged { added, removed } = change {
+                Some((added, removed))
+            } else {
+                None
+            }
+        });
+
+        assert!(path_change.is_some(), "Expected PathsChanged in diff results");
+        let (added, removed) = path_change.unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(added[0], PathBuf::from("/tmp/new"));
+        assert_eq!(removed[0], PathBuf::from("/tmp/old"));
     }
 
     #[test]
