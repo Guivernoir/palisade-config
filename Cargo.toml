@@ -1,0 +1,85 @@
+[package]
+name = "palisade-config"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.90"
+authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
+license = "Apache-2.0"
+description = "Security-conscious configuration management for honeypot systems with cryptographic tag derivation"
+repository = "https://github.com/Guivernoir/palisade-config"
+documentation = "https://docs.rs/palisade-config"
+keywords = [
+    "honeypot",
+    "security",
+    "configuration",
+    "deception",
+    "cryptography",
+]
+categories = ["config", "cryptography", "authentication"]
+readme = "README.md"
+
+[dependencies]
+# Palisade ecosystem
+palisade-errors = "0.3.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Cryptography
+sha3 = "0.10"
+hex = "0.4"
+rand = "0.8"
+zeroize = { version = "1.7", features = ["derive"] }
+
+# System info
+hostname = "0.4"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Platform detection
+cfg-if = "1.0"
+libc = "0.2.180"
+tokio = { version = "1.49.0", features = ["fs", "macros", "rt"] }
+
+[dev-dependencies]
+# Testing
+proptest = "1.4"
+tempfile = "3.8"
+criterion = { version = "0.8.1", features = ["html_reports"] }
+serde_json = "1.0"
+
+[features]
+default = []
+
+# ============================================================================
+# EXAMPLES
+# ============================================================================
+
+
+
+# ============================================================================
+# BENCHMARKS
+# ============================================================================
+
+
+
+# ============================================================================
+# TESTS
+# ============================================================================
+
+
+# ============================================================================
+# PROFILE CONFIGURATIONS
+# ============================================================================
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[profile.test]
+opt-level = 2
