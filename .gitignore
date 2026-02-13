@@ -1,3 +1,4 @@
 y/
 target/
 Cargo.lock
+tests/property.proptest-regressions

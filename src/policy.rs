@@ -2,11 +2,13 @@
 
 use crate::defaults::*;
 use crate::errors::{self, PolicyValidationError, RangeValidationError};
+use crate::timing::{enforce_operation_min_timing, TimingOperation};
 use crate::POLICY_VERSION;
 use palisade_errors::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// Policy configuration - the DECISION PLANE of your security operation.
 #[derive(Debug, Serialize, Deserialize)]
@@ -254,108 +256,123 @@ impl PolicyConfig {
     ///
     /// Returns error if file cannot be read, TOML is invalid, or validation fails.
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let started = Instant::now();
         let path = path.as_ref();
+        let result = async {
+            let contents = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| errors::io_read_error("load_policy", path, e))?;
 
-        let contents = tokio::fs::read_to_string(path).await
-            .map_err(|e| errors::io_read_error("load_policy", path, e))?;
+            let policy: PolicyConfig = toml::from_str(&contents).map_err(|e| {
+                errors::parse_error("parse_policy_toml", format!("Policy TOML syntax error: {}", e))
+            })?;
 
-        let policy: PolicyConfig = toml::from_str(&contents)
-            .map_err(|e| errors::parse_error("parse_policy_toml", format!("Policy TOML syntax error: {}", e)))?;
+            // Version validation
+            if policy.version > POLICY_VERSION {
+                return Err(errors::version_error(
+                    "validate_policy_version",
+                    policy.version,
+                    POLICY_VERSION,
+                    format!(
+                        "Policy version too new (agent: {}, policy: {}). Upgrade agent",
+                        POLICY_VERSION, policy.version
+                    ),
+                ));
+            }
 
-        // Version validation
-        if policy.version > POLICY_VERSION {
-            return Err(errors::version_error(
-                "validate_policy_version",
-                policy.version,
-                POLICY_VERSION,
-                format!(
-                    "Policy version too new (agent: {}, policy: {}). Upgrade agent",
-                    POLICY_VERSION, policy.version
-                ),
-            ));
+            if policy.version < POLICY_VERSION {
+                eprintln!(
+                    "WARNING: Policy version is older (policy: {}, agent: {}). Consider updating.",
+                    policy.version, POLICY_VERSION
+                );
+            }
+
+            policy.validate()?;
+
+            Ok(policy)
         }
-
-        if policy.version < POLICY_VERSION {
-            eprintln!(
-                "WARNING: Policy version is older (policy: {}, agent: {}). Consider updating.",
-                policy.version, POLICY_VERSION
-            );
-        }
-
-        policy.validate()?;
-
-        Ok(policy)
+        .await;
+        enforce_operation_min_timing(started, TimingOperation::PolicyLoad);
+        result
     }
 
     /// Validate policy configuration.
     pub fn validate(&self) -> Result<()> {
-        // Validate scoring policy
-        if !(0.0..=100.0).contains(&self.scoring.alert_threshold) {
-            return Err(RangeValidationError::out_of_range(
-                "scoring.alert_threshold",
-                self.scoring.alert_threshold,
-                0.0,
-                100.0,
-                "validate_policy_scoring",
-            ));
-        }
-
-        if self.scoring.correlation_window_secs == 0 || self.scoring.correlation_window_secs > 3600 {
-            return Err(RangeValidationError::out_of_range(
-                "scoring.correlation_window_secs",
-                self.scoring.correlation_window_secs,
-                1,
-                3600,
-                "validate_policy_scoring",
-            ));
-        }
-
-        // CRITICAL: Prevent memory exhaustion attacks via unbounded event buffer
-        if self.scoring.max_events_in_memory > 100_000 {
-            return Err(RangeValidationError::out_of_range(
-                "scoring.max_events_in_memory",
-                self.scoring.max_events_in_memory,
-                1,
-                100_000,
-                "validate_policy_scoring",
-            ));
-        }
-
-        // Validate response policy
-        if self.response.rules.is_empty() {
-            return Err(errors::missing_required(
-                "validate_policy_response",
-                "response.rules",
-                "no_response_actions",
-            ));
-        }
-
-        if self.response.cooldown_secs == 0 {
-            return Err(errors::invalid_value(
-                "validate_policy_response",
-                "response.cooldown_secs",
-                "response.cooldown_secs cannot be zero",
-            ));
-        }
-
-        // Check for duplicate severity mappings
-        let mut seen = HashSet::new();
-        for rule in &self.response.rules {
-            if !seen.insert(rule.severity) {
-                return Err(PolicyValidationError::duplicate_severity(&rule.severity.to_string()));
+        let started = Instant::now();
+        let result = (|| {
+            // Validate scoring policy
+            if !(0.0..=100.0).contains(&self.scoring.alert_threshold) {
+                return Err(RangeValidationError::out_of_range(
+                    "scoring.alert_threshold",
+                    self.scoring.alert_threshold,
+                    0.0,
+                    100.0,
+                    "validate_policy_scoring",
+                ));
             }
 
-            // Validate custom conditions against whitelist
-            for condition in &rule.conditions {
-                if let ResponseCondition::Custom { name, .. } = condition {
-                    if !self.registered_custom_conditions.contains(name) {
-                        return Err(PolicyValidationError::unregistered_condition(name));
+            if self.scoring.correlation_window_secs == 0
+                || self.scoring.correlation_window_secs > 3600
+            {
+                return Err(RangeValidationError::out_of_range(
+                    "scoring.correlation_window_secs",
+                    self.scoring.correlation_window_secs,
+                    1,
+                    3600,
+                    "validate_policy_scoring",
+                ));
+            }
+
+            // CRITICAL: Prevent memory exhaustion and invalid zero-capacity buffers.
+            if self.scoring.max_events_in_memory == 0 || self.scoring.max_events_in_memory > 100_000
+            {
+                return Err(RangeValidationError::out_of_range(
+                    "scoring.max_events_in_memory",
+                    self.scoring.max_events_in_memory,
+                    1,
+                    100_000,
+                    "validate_policy_scoring",
+                ));
+            }
+
+            // Validate response policy
+            if self.response.rules.is_empty() {
+                return Err(errors::missing_required(
+                    "validate_policy_response",
+                    "response.rules",
+                    "no_response_actions",
+                ));
+            }
+
+            if self.response.cooldown_secs == 0 {
+                return Err(errors::invalid_value(
+                    "validate_policy_response",
+                    "response.cooldown_secs",
+                    "response.cooldown_secs cannot be zero",
+                ));
+            }
+
+            // Check for duplicate severity mappings
+            let mut seen = HashSet::new();
+            for rule in &self.response.rules {
+                if !seen.insert(rule.severity) {
+                    return Err(PolicyValidationError::duplicate_severity(&rule.severity.to_string()));
+                }
+
+                // Validate custom conditions against whitelist
+                for condition in &rule.conditions {
+                    if let ResponseCondition::Custom { name, .. } = condition {
+                        if !self.registered_custom_conditions.contains(name) {
+                            return Err(PolicyValidationError::unregistered_condition(name));
+                        }
                     }
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })();
+        enforce_operation_min_timing(started, TimingOperation::PolicyValidate);
+        result
     }
 
     /// Check if process name is suspicious (case-insensitive, optimized hot path).
@@ -365,14 +382,40 @@ impl PolicyConfig {
     #[inline]
     #[must_use]
     pub fn is_suspicious_process(&self, name: &str) -> bool {
-        // Convert to lowercase only once per character during comparison
-        // Patterns are pre-lowercased during deserialization
-        let name_lower = name.to_ascii_lowercase();
-        self.deception
+        let started = Instant::now();
+        let found = self
+            .deception
             .suspicious_processes
             .iter()
-            .any(|pattern| name_lower.contains(pattern.as_str()))
+            .any(|pattern| contains_ascii_case_insensitive(name, pattern.as_str()));
+        enforce_operation_min_timing(started, TimingOperation::PolicySuspiciousCheckLegacy);
+        found
     }
+}
+
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    for start in 0..=(h.len() - n.len()) {
+        let mut matched = true;
+        for i in 0..n.len() {
+            if h[start + i].to_ascii_lowercase() != n[i].to_ascii_lowercase() {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return true;
+        }
+    }
+    false
 }
 
 impl Default for PolicyConfig {

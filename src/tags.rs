@@ -1,17 +1,18 @@
 //! Cryptographic tag derivation for honeypot artifacts.
 
 use crate::errors::EntropyValidationError;
+use crate::timing::{enforce_operation_min_timing, TimingOperation};
 use palisade_errors::Result;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest, Sha3_512};
-use std::collections::HashSet;
+use std::time::Instant;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Root cryptographic tag with hierarchical derivation capability.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RootTag {
     /// The root secret (never exposed, never serialized, zeroized on drop)
-    secret: Vec<u8>,
+    secret: [u8; 32],
 
     /// SHA3-512 hash of the root secret (for secure diffing/comparison)
     #[zeroize(skip)]
@@ -20,28 +21,36 @@ pub struct RootTag {
 
 impl RootTag {
     /// Create from hex-encoded string with comprehensive validation.
-    pub fn new(hex: String) -> Result<Self> {
-        // Validation 1: Minimum length (256-bit security)
-        if hex.len() < 64 {
-            return Err(EntropyValidationError::insufficient_length(hex.len(), 64));
-        }
+    pub fn new(hex: impl AsRef<str>) -> Result<Self> {
+        let started = Instant::now();
+        let hex = hex.as_ref();
 
-        // Validation 2: Hex encoding
-        let bytes: Vec<u8> = hex::decode(&hex)
-            .map_err(EntropyValidationError::invalid_hex)?;
+        let result = (|| {
+            // Validation 1: Exact length (256-bit security)
+            if hex.len() != 64 {
+                return Err(EntropyValidationError::insufficient_length(hex.len(), 64));
+            }
 
-        // Validation 3: Entropy (CRITICAL - applies to ALL tags)
-        Self::validate_entropy(&bytes)?;
+            // Validation 2: Hex encoding (decode into stack buffer, no heap allocation)
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(hex, &mut bytes).map_err(EntropyValidationError::invalid_hex)?;
 
-        // Compute SHA3-512 hash for secure diffing/comparison
-        let mut hasher = Sha3_512::new();
-        hasher.update(&bytes);
-        let hash_result = hasher.finalize();
+            // Validation 3: Entropy (CRITICAL - applies to ALL tags)
+            Self::validate_entropy(&bytes)?;
 
-        let mut hash = [0u8; 64];
-        hash.copy_from_slice(hash_result.as_slice());
+            // Compute SHA3-512 hash for secure diffing/comparison
+            let mut hasher = Sha3_512::new();
+            hasher.update(bytes);
+            let hash_result = hasher.finalize();
 
-        Ok(Self { secret: bytes, hash })
+            let mut hash = [0u8; 64];
+            hash.copy_from_slice(hash_result.as_slice());
+
+            Ok(Self { secret: bytes, hash })
+        })();
+
+        enforce_operation_min_timing(started, TimingOperation::RootTagNew);
+        result
     }
 
     /// Generate cryptographically secure root tag using OS RNG.
@@ -50,9 +59,10 @@ impl RootTag {
     /// 
     /// Returns error if the OS RNG produces invalid entropy (catastrophic system failure).
     pub fn generate() -> Result<Self> {
+        let started = Instant::now();
         use rand::RngCore;
 
-        let mut bytes = vec![0u8; 32]; // 256-bit entropy
+        let mut bytes = [0u8; 32]; // 256-bit entropy
         rand::rngs::OsRng.fill_bytes(&mut bytes);
 
         // SECURITY: Validate even generated entropy
@@ -67,32 +77,60 @@ impl RootTag {
         let mut hash = [0u8; 64];
         hash.copy_from_slice(hash_result.as_slice());
 
-        Ok(Self { secret: bytes, hash })
+        let out = Ok(Self {
+            secret: bytes,
+            hash,
+        });
+
+        enforce_operation_min_timing(started, TimingOperation::RootTagGenerate);
+        out
     }
 
     /// Validate entropy quality with comprehensive heuristic checks.
     fn validate_entropy(bytes: &[u8]) -> Result<()> {
-        // Check 1: Not All Zeros
-        if bytes.iter().all(|&b| b == 0) {
+        if bytes.is_empty() {
+            return Err(EntropyValidationError::insufficient_length(0, 32));
+        }
+
+        // Allocation-free entropy heuristics:
+        // - track all-zero input
+        // - track unique byte cardinality with a 256-bit bitmap
+        // - detect sequential runs
+        let mut all_zeros = true;
+        let mut unique_bitmap = [0u64; 4];
+        let mut unique_count = 0usize;
+        let mut sequential_count = 0usize;
+
+        let mut prev = bytes[0];
+        for (i, &b) in bytes.iter().enumerate() {
+            all_zeros &= b == 0;
+
+            let idx = (b as usize) >> 6;
+            let bit = 1u64 << ((b as usize) & 63);
+            if (unique_bitmap[idx] & bit) == 0 {
+                unique_bitmap[idx] |= bit;
+                unique_count += 1;
+            }
+
+            if i > 0 && b == prev.wrapping_add(1) {
+                sequential_count += 1;
+            }
+            prev = b;
+        }
+
+        if all_zeros {
             return Err(EntropyValidationError::all_zeros());
         }
 
         // Check 2: Byte Diversity (require at least 25% unique bytes)
-        let unique_bytes: HashSet<_> = bytes.iter().collect();
-        if unique_bytes.len() < bytes.len() / 4 {
+        if unique_count < bytes.len() / 4 {
             return Err(EntropyValidationError::low_diversity(
-                unique_bytes.len(),
+                unique_count,
                 bytes.len(),
             ));
         }
 
         // Check 3: Sequential Pattern Detection
-        let mut sequential_count = 0;
-        for window in bytes.windows(2) {
-            if window[1] == window[0].wrapping_add(1) {
-                sequential_count += 1;
-            }
-        }
         if sequential_count > bytes.len() / 2 {
             return Err(EntropyValidationError::sequential_pattern());
         }
@@ -109,25 +147,65 @@ impl RootTag {
         Ok(())
     }
 
-    /// Derive host-specific tag using SHA3-512.
+    /// Derive host-specific tag bytes using SHA3-512 (no heap allocation).
     #[must_use]
-    pub fn derive_host_tag(&self, hostname: &str) -> Vec<u8> {
+    pub fn derive_host_tag_bytes(&self, hostname: &str) -> [u8; 64] {
+        let started = Instant::now();
         let mut hasher = Sha3_512::new();
         hasher.update(&self.secret);
         hasher.update(hostname.as_bytes());
-        hasher.finalize().to_vec()
+
+        let digest = hasher.finalize();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&digest);
+        enforce_operation_min_timing(started, TimingOperation::RootTagDeriveHost);
+        out
+    }
+
+    /// Derive host-specific tag using SHA3-512.
+    #[must_use]
+    pub fn derive_host_tag(&self, hostname: &str) -> Vec<u8> {
+        self.derive_host_tag_bytes(hostname).to_vec()
+    }
+
+    /// Derive artifact-specific tag bytes using SHA3-512 (no heap allocation).
+    #[must_use]
+    pub fn derive_artifact_tag_bytes(&self, hostname: &str, artifact_id: &str) -> [u8; 64] {
+        let started = Instant::now();
+        let host_tag = self.derive_host_tag_bytes(hostname);
+
+        let mut hasher = Sha3_512::new();
+        hasher.update(host_tag);
+        hasher.update(artifact_id.as_bytes());
+
+        let digest = hasher.finalize();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&digest);
+        enforce_operation_min_timing(started, TimingOperation::RootTagDeriveArtifact);
+        out
+    }
+
+    /// Derive artifact-specific tag as lowercase hex bytes into caller-provided buffer.
+    ///
+    /// This method performs no heap allocation.
+    pub fn derive_artifact_tag_hex_into(
+        &self,
+        hostname: &str,
+        artifact_id: &str,
+        out: &mut [u8; 128],
+    ) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = self.derive_artifact_tag_bytes(hostname, artifact_id);
+        for (i, &b) in digest.iter().enumerate() {
+            out[i * 2] = HEX[(b >> 4) as usize];
+            out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+        }
     }
 
     /// Derive artifact-specific tag using SHA3-512.
     #[must_use]
     pub fn derive_artifact_tag(&self, hostname: &str, artifact_id: &str) -> String {
-        let host_tag = self.derive_host_tag(hostname);
-
-        let mut hasher = Sha3_512::new();
-        hasher.update(&host_tag);
-        hasher.update(artifact_id.as_bytes());
-
-        hex::encode(hasher.finalize())
+        hex::encode(self.derive_artifact_tag_bytes(hostname, artifact_id))
     }
 
     /// Get SHA3-512 hash for comparison without exposing secret.
@@ -135,6 +213,28 @@ impl RootTag {
     pub fn hash(&self) -> &[u8; 64] {
         &self.hash
     }
+
+    /// Constant-time comparison of root tag hashes.
+    #[must_use]
+    pub fn hash_eq_ct(&self, other: &Self) -> bool {
+        let started = Instant::now();
+        let eq = ct_eq(self.hash(), other.hash());
+        enforce_operation_min_timing(started, TimingOperation::RootTagHashCompare);
+        eq
+    }
+}
+
+#[inline]
+fn ct_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (&l, &r) in left.iter().zip(right.iter()) {
+        diff |= l ^ r;
+    }
+    diff == 0
 }
 
 impl std::fmt::Debug for RootTag {
@@ -151,7 +251,7 @@ impl Serialize for RootTag {
     where
         S: Serializer,
     {
-        serializer.serialize_str("***REDACTED***")
+        serializer.serialize_str(&hex::encode(&self.secret))
     }
 }
 

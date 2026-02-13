@@ -10,11 +10,13 @@
 use crate::defaults::*;
 use crate::errors::{self, *};
 use crate::tags::RootTag;
+use crate::timing::{enforce_operation_min_timing, TimingOperation};
 use crate::validation::ValidationMode;
 use crate::CONFIG_VERSION;
 use palisade_errors::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Master configuration - the MECHANICS of your deception operation.
@@ -242,60 +244,77 @@ impl Config {
     ///
     /// Returns error if file cannot be read, TOML is invalid, or validation fails.
     pub async fn from_file_with_mode<P: AsRef<Path>>(path: P, mode: ValidationMode) -> Result<Self> {
+        let started = Instant::now();
         let path = path.as_ref();
+        let result = async {
+            // Platform-aware permission validation
+            Self::validate_file_permissions(path)?;
 
-        // Platform-aware permission validation
-        Self::validate_file_permissions(path)?;
+            let contents = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| errors::io_read_error("load_config", path, e))?;
 
-        let contents = tokio::fs::read_to_string(path).await
-            .map_err(|e| errors::io_read_error("load_config", path, e))?;
+            let mut config: Config = toml::from_str(&contents).map_err(|e| {
+                let location = e
+                    .span()
+                    .map(|s| format!("line {}", contents[..s.start].matches('\n').count() + 1))
+                    .unwrap_or_else(|| "unknown location".to_string());
 
-        let mut config: Config = toml::from_str(&contents).map_err(|e| {
-            let location = e
-                .span()
-                .map(|s| format!("line {}", contents[..s.start].matches('\n').count() + 1))
-                .unwrap_or_else(|| "unknown location".to_string());
+                errors::parse_error(
+                    "parse_config_toml",
+                    format!("Invalid TOML syntax at {}: {}", location, e),
+                )
+            })?;
 
-            errors::parse_error(
-                "parse_config_toml",
-                format!("Invalid TOML syntax at {}: {}", location, e),
-            )
-        })?;
+            // Convert raw fields to protected types
+            config.agent.instance_id =
+                ProtectedString::new(std::mem::take(&mut config.agent.instance_id_raw));
+            config.agent.work_dir =
+                ProtectedPath::new(PathBuf::from(std::mem::take(&mut config.agent.work_dir_raw)));
 
-        // Convert raw fields to protected types
-        config.agent.instance_id =
-            ProtectedString::new(std::mem::take(&mut config.agent.instance_id_raw));
-        config.agent.work_dir =
-            ProtectedPath::new(PathBuf::from(std::mem::take(&mut config.agent.work_dir_raw)));
+            // Version validation
+            if config.version != CONFIG_VERSION {
+                let message = if config.version > CONFIG_VERSION {
+                    "Configuration version too new - upgrade agent"
+                } else {
+                    "Configuration version outdated - update config"
+                };
 
-        // Version validation
-        if config.version != CONFIG_VERSION {
-            let message = if config.version > CONFIG_VERSION {
-                "Configuration version too new - upgrade agent"
-            } else {
-                "Configuration version outdated - update config"
-            };
+                return Err(errors::version_error(
+                    "validate_config_version",
+                    config.version,
+                    CONFIG_VERSION,
+                    message,
+                ));
+            }
 
-            return Err(errors::version_error(
-                "validate_config_version",
-                config.version,
-                CONFIG_VERSION,
-                message,
-            ));
+            config.validate_with_mode(mode)?;
+
+            Ok(config)
         }
-
-        config.validate_with_mode(mode)?;
-
-        Ok(config)
+        .await;
+        enforce_operation_min_timing(started, TimingOperation::ConfigLoad);
+        result
     }
 
     /// Validate configuration with specific mode.
     fn validate_with_mode(&self, mode: ValidationMode) -> Result<()> {
-        self.validate_agent()?;
-        self.validate_deception(mode)?;
-        self.validate_telemetry(mode)?;
-        self.validate_logging(mode)?;
-        Ok(())
+        let started = Instant::now();
+        let result = (|| {
+            self.validate_agent()?;
+            self.validate_deception(mode)?;
+            self.validate_telemetry(mode)?;
+            self.validate_logging(mode)?;
+            Ok(())
+        })();
+        enforce_operation_min_timing(
+            started,
+            match mode {
+                ValidationMode::Standard => TimingOperation::ConfigValidateStandard,
+                ValidationMode::Strict => TimingOperation::ConfigValidateStrict,
+            },
+        );
+        result
     }
 
     /// Validate configuration (standard mode).
@@ -491,7 +510,8 @@ impl Config {
     /// Get effective hostname for tag derivation (returns reference to avoid cloning).
     #[must_use]
     pub fn hostname(&self) -> std::borrow::Cow<'_, str> {
-        match &self.agent.hostname {
+        let started = Instant::now();
+        let hostname = match &self.agent.hostname {
             Some(h) => std::borrow::Cow::Borrowed(h.as_str()),
             None => {
                 // Only allocate if we need to fetch system hostname
@@ -501,7 +521,9 @@ impl Config {
                     .unwrap_or_else(|| "unknown-host".to_string());
                 std::borrow::Cow::Owned(system_hostname)
             }
-        }
+        };
+        enforce_operation_min_timing(started, TimingOperation::ConfigHostname);
+        hostname
     }
 }
 

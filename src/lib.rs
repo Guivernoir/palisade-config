@@ -22,7 +22,9 @@ mod config;
 mod defaults;
 mod errors;
 mod policy;
+mod runtime;
 mod tags;
+mod timing;
 mod validation;
 
 // Re-export core types for public API
@@ -34,7 +36,9 @@ pub use policy::{
     ActionType, DeceptionPolicy, PolicyConfig, ResponseCondition, ResponsePolicy, ResponseRule,
     ScoringPolicy, ScoringWeights, Severity,
 };
+pub use runtime::{RuntimeConfig, RuntimePolicy};
 pub use tags::RootTag;
+pub use timing::{get_timing_profile, set_timing_profile, TimingProfile};
 pub use validation::{ConfigChange, PolicyChange, ValidationMode};
 
 // Re-export from palisade-errors for convenience

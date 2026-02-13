@@ -1,8 +1,10 @@
 //! Configuration and policy diffing for change tracking.
 
 use crate::{Config, PolicyConfig};
+use crate::timing::{enforce_operation_min_timing, TimingOperation};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// Validation strictness level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,10 +63,11 @@ impl Config {
     /// Diff configuration against another configuration.
     #[must_use]
     pub fn diff(&self, other: &Config) -> Vec<ConfigChange> {
+        let started = Instant::now();
         let mut changes = Vec::new();
 
         // Compare root tags via hash (secure, no exposure)
-        if self.deception.root_tag.hash() != other.deception.root_tag.hash() {
+        if !self.deception.root_tag.hash_eq_ct(&other.deception.root_tag) {
             changes.push(ConfigChange::RootTagChanged {
                 old_hash: hex::encode(&self.deception.root_tag.hash()[..8]),
                 new_hash: hex::encode(&other.deception.root_tag.hash()[..8]),
@@ -97,6 +100,7 @@ impl Config {
             });
         }
 
+        enforce_operation_min_timing(started, TimingOperation::ConfigDiff);
         changes
     }
 }
@@ -105,6 +109,7 @@ impl PolicyConfig {
     /// Diff policy against another policy.
     #[must_use]
     pub fn diff(&self, other: &PolicyConfig) -> Vec<PolicyChange> {
+        let started = Instant::now();
         let mut changes = Vec::new();
 
         // Threshold changes
@@ -141,6 +146,7 @@ impl PolicyConfig {
             changes.push(PolicyChange::SuspiciousProcessesChanged { added, removed });
         }
 
+        enforce_operation_min_timing(started, TimingOperation::PolicyDiff);
         changes
     }
 }

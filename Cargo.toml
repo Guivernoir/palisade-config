@@ -1,6 +1,6 @@
 [package]
 name = "palisade-config"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.90"
 authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
@@ -40,6 +40,7 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 cfg-if = "1.0"
 libc = "0.2.180"
 tokio = { version = "1.49.0", features = ["fs", "macros", "rt"] }
+heapless = "0.9.1"
 
 [dev-dependencies]
 # Testing
@@ -47,6 +48,7 @@ proptest = "1.4"
 tempfile = "3.8"
 criterion = { version = "0.8.1", features = ["html_reports"] }
 serde_json = "1.0"
+stats_alloc = "0.1.10"
 
 [features]
 default = []
@@ -61,12 +63,26 @@ default = []
 # BENCHMARKS
 # ============================================================================
 
-
+[[bench]]
+name = "config_bench"
+path = "benches/config_performance.rs"
+harness = false
 
 # ============================================================================
 # TESTS
 # ============================================================================
 
+[[test]]
+name = "integration_tests"
+path = "tests/integration.rs"
+
+[[test]]
+name = "property_tests"
+path = "tests/property.rs"
+
+[[test]]
+name = "security_tests"
+path = "tests/security.rs"
 
 # ============================================================================
 # PROFILE CONFIGURATIONS
