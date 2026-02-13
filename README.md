@@ -2,6 +2,10 @@
 
 Security-focused configuration and policy crate for deception/honeypot systems.
 
+[![Crates.io](https://img.shields.io/crates/v/palisade-config.svg)](https://crates.io/crates/palisade-config)
+[![Documentation](https://docs.rs/palisade-config/badge.svg)](https://docs.rs/palisade-config)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 ## What this crate provides
 
 - Typed `Config` and `PolicyConfig` models with validation
