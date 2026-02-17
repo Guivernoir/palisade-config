@@ -17,13 +17,13 @@ Security-focused configuration and policy crate for deception/honeypot systems.
 
 ## Version
 
-Current crate version: `1.0.1`
+Current crate version: `1.0.2`
 
 ## Installation
 
 ```toml
 [dependencies]
-palisade-config = "1.0.1"
+palisade-config = "1.0.2"
 ```
 
 ## Prerequisites: file permissions
