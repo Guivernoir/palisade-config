@@ -71,7 +71,7 @@ impl RootTag {
 
         // Compute SHA3-512 hash
         let mut hasher = Sha3_512::new();
-        hasher.update(&bytes);
+        hasher.update(bytes);
         let hash_result = hasher.finalize();
 
         let mut hash = [0u8; 64];
@@ -152,7 +152,7 @@ impl RootTag {
     pub fn derive_host_tag_bytes(&self, hostname: &str) -> [u8; 64] {
         let started = Instant::now();
         let mut hasher = Sha3_512::new();
-        hasher.update(&self.secret);
+        hasher.update(self.secret);
         hasher.update(hostname.as_bytes());
 
         let digest = hasher.finalize();
@@ -251,7 +251,7 @@ impl Serialize for RootTag {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&hex::encode(&self.secret))
+        serializer.serialize_str(&hex::encode(self.secret))
     }
 }
 

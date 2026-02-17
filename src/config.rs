@@ -7,8 +7,8 @@
 //!
 //! This does NOT define decision-making (see [`crate::policy`]).
 
-use crate::defaults::*;
-use crate::errors::{self, *};
+use crate::defaults::{default_version, default_honeytoken_count, default_artifact_permissions, default_event_buffer_size, default_log_format, default_rotate_size, default_max_log_files, default_log_level};
+use crate::errors::{self, UnixPermissionError, PathValidationError, CollectionValidationError, RangeValidationError};
 use crate::tags::RootTag;
 use crate::timing::{enforce_operation_min_timing, TimingOperation};
 use crate::validation::ValidationMode;
@@ -172,18 +172,21 @@ pub struct ProtectedString {
 impl ProtectedString {
     /// Create from string (takes ownership).
     #[inline]
+    #[must_use] 
     pub fn new(s: String) -> Self {
         Self { inner: s }
     }
 
     /// Access the inner string by reference.
     #[inline]
+    #[must_use] 
     pub fn as_str(&self) -> &str {
         &self.inner
     }
 
     /// Consume and return inner string.
     #[inline]
+    #[must_use] 
     pub fn into_inner(mut self) -> String {
         std::mem::take(&mut self.inner)
     }
@@ -203,20 +206,23 @@ pub struct ProtectedPath {
 }
 
 impl ProtectedPath {
-    /// Create from PathBuf (takes ownership).
+    /// Create from `PathBuf` (takes ownership).
     #[inline]
+    #[must_use] 
     pub fn new(path: PathBuf) -> Self {
         Self { inner: path }
     }
 
     /// Access the inner path by reference.
     #[inline]
+    #[must_use] 
     pub fn as_path(&self) -> &Path {
         &self.inner
     }
 
-    /// Consume and return inner PathBuf.
+    /// Consume and return inner `PathBuf`.
     #[inline]
+    #[must_use] 
     pub fn into_inner(mut self) -> PathBuf {
         std::mem::replace(&mut self.inner, PathBuf::new())
     }
@@ -256,13 +262,11 @@ impl Config {
 
             let mut config: Config = toml::from_str(&contents).map_err(|e| {
                 let location = e
-                    .span()
-                    .map(|s| format!("line {}", contents[..s.start].matches('\n').count() + 1))
-                    .unwrap_or_else(|| "unknown location".to_string());
+                    .span().map_or_else(|| "unknown location".to_string(), |s| format!("line {}", contents[..s.start].matches('\n').count() + 1));
 
                 errors::parse_error(
                     "parse_config_toml",
-                    format!("Invalid TOML syntax at {}: {}", location, e),
+                    format!("Invalid TOML syntax at {location}: {e}"),
                 )
             })?;
 
@@ -381,17 +385,15 @@ impl Config {
                 ));
             }
 
-            if mode == ValidationMode::Strict {
-                if let Some(parent) = path.parent() {
-                    if !parent.exists() {
+            if mode == ValidationMode::Strict
+                && let Some(parent) = path.parent()
+                    && !parent.exists() {
                         return Err(PathValidationError::parent_missing(
                             "deception.decoy_paths",
                             Some(idx),
                             "validate_deception",
                         ));
                     }
-                }
-            }
         }
 
         if self.deception.credential_types.is_empty() {
@@ -470,8 +472,8 @@ impl Config {
             ));
         }
 
-        if mode == ValidationMode::Strict {
-            if let Some(parent) = self.logging.log_path.parent() {
+        if mode == ValidationMode::Strict
+            && let Some(parent) = self.logging.log_path.parent() {
                 if !parent.exists() {
                     return Err(PathValidationError::parent_missing(
                         "logging.log_path",
@@ -485,7 +487,6 @@ impl Config {
                     .map_err(|e| errors::io_write_error("test_log_directory_write", &test_file, e))?;
                 let _ = std::fs::remove_file(&test_file);
             }
-        }
 
         if self.logging.rotate_size_bytes < 1024 * 1024 {
             return Err(RangeValidationError::below_minimum(
@@ -511,16 +512,13 @@ impl Config {
     #[must_use]
     pub fn hostname(&self) -> std::borrow::Cow<'_, str> {
         let started = Instant::now();
-        let hostname = match &self.agent.hostname {
-            Some(h) => std::borrow::Cow::Borrowed(h.as_str()),
-            None => {
-                // Only allocate if we need to fetch system hostname
-                let system_hostname = hostname::get()
-                    .ok()
-                    .and_then(|h| h.into_string().ok())
-                    .unwrap_or_else(|| "unknown-host".to_string());
-                std::borrow::Cow::Owned(system_hostname)
-            }
+        let hostname = if let Some(h) = &self.agent.hostname { std::borrow::Cow::Borrowed(h.as_str()) } else {
+            // Only allocate if we need to fetch system hostname
+            let system_hostname = hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown-host".to_string());
+            std::borrow::Cow::Owned(system_hostname)
         };
         enforce_operation_min_timing(started, TimingOperation::ConfigHostname);
         hostname

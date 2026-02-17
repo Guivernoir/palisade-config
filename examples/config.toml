@@ -1,0 +1,79 @@
+# Palisade Agent Configuration
+# Schema version - do not change unless upgrading
+version = 1
+
+# ============================================================
+# Agent Identity
+# ============================================================
+[agent]
+# Unique identifier for telemetry correlation (hostname or UUID)
+instance_id = "dev-agent-01"
+
+# Absolute path to agent working directory (must be absolute)
+work_dir = "/var/lib/palisade-agent"
+
+# Optional: environment label for log tagging
+environment = "dev"
+
+# Optional: override hostname used for tag derivation
+# hostname = "my-custom-hostname"
+
+# ============================================================
+# Deception Artifact Configuration
+# Contains the root_tag secret - handle with care
+# ============================================================
+[deception]
+# Absolute paths where decoy files will be placed
+decoy_paths = [
+    "/tmp/.credentials",
+    "/opt/.backup",
+]
+
+# Types of credentials to generate
+credential_types = ["aws", "ssh"]
+
+# Number of honeytokens to generate (1-100)
+honeytoken_count = 5
+
+# REQUIRED: 64-character hex-encoded 256-bit root tag
+# Generate a fresh one with: openssl rand -hex 32
+# Entropy requirements: not all-zeros, not sequential, >= 25% unique bytes
+root_tag = "3ea3f3401fe7431b485a284ea8a242eb3ca8c424f2b868ddd3ce03df6db43914"
+
+# Unix permissions for created artifact files (octal, max 0o777)
+artifact_permissions = 0o600
+
+# ============================================================
+# Telemetry Collection
+# ============================================================
+[telemetry]
+# Absolute paths to monitor for file access events
+watch_paths = [
+    "/tmp",
+    "/opt",
+]
+
+# Event ring-buffer capacity (minimum 100)
+event_buffer_size = 10000
+
+# Enable syscall-level monitoring (high overhead - use with care)
+enable_syscall_monitor = false
+
+# ============================================================
+# Logging
+# ============================================================
+[logging]
+# Absolute path for log output (parent directory must exist in Strict mode)
+log_path = "/var/log/palisade-agent.log"
+
+# Format: "json" (machine-parseable) or "text" (human-readable)
+format = "json"
+
+# Rotate log file at this size in bytes (minimum 1 MiB = 1048576)
+rotate_size_bytes = 104857600  # 100 MiB
+
+# Maximum number of rotated log files to retain (must be >= 1)
+max_log_files = 10
+
+# Minimum log level: DEBUG, INFO, WARN, ERROR
+level = "INFO"

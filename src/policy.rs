@@ -1,6 +1,6 @@
 //! Policy configuration for honeypot decision-making.
 
-use crate::defaults::*;
+use crate::defaults::{default_policy_version, default_correlation_window, default_alert_threshold, default_max_events, default_true, default_business_hours_start, default_business_hours_end, default_artifact_access_weight, default_suspicious_process_weight, default_rapid_enum_weight, default_off_hours_weight, default_ancestry_suspicious_weight, default_cooldown, default_max_kills};
 use crate::errors::{self, PolicyValidationError, RangeValidationError};
 use crate::timing::{enforce_operation_min_timing, TimingOperation};
 use crate::POLICY_VERSION;
@@ -264,7 +264,7 @@ impl PolicyConfig {
                 .map_err(|e| errors::io_read_error("load_policy", path, e))?;
 
             let policy: PolicyConfig = toml::from_str(&contents).map_err(|e| {
-                errors::parse_error("parse_policy_toml", format!("Policy TOML syntax error: {}", e))
+                errors::parse_error("parse_policy_toml", format!("Policy TOML syntax error: {e}"))
             })?;
 
             // Version validation
@@ -361,11 +361,10 @@ impl PolicyConfig {
 
                 // Validate custom conditions against whitelist
                 for condition in &rule.conditions {
-                    if let ResponseCondition::Custom { name, .. } = condition {
-                        if !self.registered_custom_conditions.contains(name) {
+                    if let ResponseCondition::Custom { name, .. } = condition
+                        && !self.registered_custom_conditions.contains(name) {
                             return Err(PolicyValidationError::unregistered_condition(name));
                         }
-                    }
                 }
             }
 
@@ -406,7 +405,7 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     for start in 0..=(h.len() - n.len()) {
         let mut matched = true;
         for i in 0..n.len() {
-            if h[start + i].to_ascii_lowercase() != n[i].to_ascii_lowercase() {
+            if !h[start + i].eq_ignore_ascii_case(&n[i]) {
                 matched = false;
                 break;
             }

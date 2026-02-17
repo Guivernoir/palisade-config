@@ -1,0 +1,115 @@
+# Palisade Agent Policy Configuration
+# Schema version - do not change unless upgrading
+version = 1
+
+# ============================================================
+# Scoring Policy
+# ============================================================
+[scoring]
+# Time window for correlating events (seconds)
+correlation_window_secs = 300
+
+# Confidence score threshold to trigger an alert (0.0 - 100.0)
+alert_threshold = 50.0
+
+# Maximum events to retain in memory within correlation window
+max_events_in_memory = 10000
+
+# Enable time-of-day multipliers (off-hours activity scores higher)
+enable_time_scoring = true
+
+# Enable process ancestry tracking
+enable_ancestry_tracking = true
+
+# Business hours (24h clock) - activity outside these hours scores higher
+business_hours_start = 9
+business_hours_end = 17
+
+[scoring.weights]
+# Score added when any deception artifact is accessed
+artifact_access = 50.0
+
+# Score added when the accessing process matches a suspicious pattern
+suspicious_process = 30.0
+
+# Score added for rapid sequential enumeration
+rapid_enumeration = 20.0
+
+# Score added for off-hours activity
+off_hours_activity = 15.0
+
+# Score added when process ancestry is suspicious
+ancestry_suspicious = 10.0
+
+# ============================================================
+# Response Policy
+# ============================================================
+[response]
+# Minimum seconds between responses to prevent alert storms
+cooldown_secs = 60
+
+# Safety limit: maximum processes to kill per incident
+max_kills_per_incident = 10
+
+# Dry-run mode: log what WOULD happen, but don't execute
+dry_run = true
+
+# Response rules (evaluated in order, matched by severity)
+# Severity levels: Low | Medium | High | Critical
+
+[[response.rules]]
+severity = "Low"
+action = "log"
+# No conditions = always execute for this severity
+
+[[response.rules]]
+severity = "Medium"
+action = "alert"
+
+[[response.rules]]
+severity = "High"
+action = "alert"
+conditions = [
+    { type = "min_confidence", threshold = 60.0 },
+    { type = "min_signal_types", count = 2 },
+]
+
+[[response.rules]]
+severity = "Critical"
+action = "kill_process"
+conditions = [
+    { type = "min_confidence", threshold = 80.0 },
+    { type = "min_signal_types", count = 3 },
+    { type = "not_parented_by", process_name = "systemd" },
+]
+
+# ============================================================
+# Deception Detection Patterns
+# ============================================================
+[deception]
+# Process names that trigger elevated scoring (case-insensitive substring match)
+suspicious_processes = [
+    "mimikatz",
+    "bloodhound",
+    "sharphound",
+    "rubeus",
+    "secretsdump",
+    "crackmapexec",
+    "meterpreter",
+]
+
+# File patterns that indicate reconnaissance activity
+suspicious_patterns = [
+    ".aws/credentials",
+    ".ssh/id_rsa",
+    "shadow",
+    "passwd",
+    ".git-credentials",
+    "wallet.dat",
+]
+
+# ============================================================
+# Custom Conditions (pre-registration for injection protection)
+# Any "custom" condition name used in response.rules MUST appear here
+# ============================================================
+registered_custom_conditions = []

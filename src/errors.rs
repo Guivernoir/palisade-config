@@ -62,7 +62,7 @@ pub(crate) fn missing_required(
     AgentError::config(
         definitions::CFG_MISSING_REQUIRED,
         operation.to_owned(),
-        format!("{} cannot be empty", field),
+        format!("{field} cannot be empty"),
     )
     .with_metadata("field", field.to_owned())
     .with_metadata("impact", impact.to_owned())
@@ -205,7 +205,7 @@ impl PathValidationError {
         invalid_value(
             operation,
             field,
-            format!("{} must be an absolute path", field),
+            format!("{field} must be an absolute path"),
         )
     }
 
@@ -214,7 +214,7 @@ impl PathValidationError {
     pub fn parent_missing(field: &str, index: Option<usize>, operation: &str) -> AgentError {
         let mut err = validation_failed(
             operation,
-            format!("{} parent directory does not exist", field),
+            format!("{field} parent directory does not exist"),
         )
         .with_metadata("field", field.to_owned());
 
@@ -230,7 +230,7 @@ impl PathValidationError {
     pub fn not_found(field: &str, index: Option<usize>, operation: &str) -> AgentError {
         let mut err = validation_failed(
             operation,
-            format!("{} does not exist", field),
+            format!("{field} does not exist"),
         )
         .with_metadata("field", field.to_owned());
 
@@ -261,7 +261,7 @@ impl RangeValidationError {
             field,
             actual.to_string(),
             format!("minimum: {}", minimum.to_string()),
-            format!("{} below minimum threshold", field),
+            format!("{field} below minimum threshold"),
         )
     }
 
@@ -278,7 +278,7 @@ impl RangeValidationError {
             field,
             actual.to_string(),
             format!("maximum: {}", maximum.to_string()),
-            format!("{} exceeds maximum threshold", field),
+            format!("{field} exceeds maximum threshold"),
         )
     }
 
@@ -296,7 +296,7 @@ impl RangeValidationError {
             field,
             actual.to_string(),
             format!("{}-{}", min.to_string(), max.to_string()),
-            format!("{} must be within valid range", field),
+            format!("{field} must be within valid range"),
         )
     }
 }
@@ -390,8 +390,7 @@ impl EntropyValidationError {
             "validate_entropy",
             "root_tag",
             format!(
-                "Root tag has low entropy (only {}/{} unique bytes)",
-                unique_count, total_count
+                "Root tag has low entropy (only {unique_count}/{total_count} unique bytes)"
             ),
         )
     }
@@ -422,8 +421,8 @@ impl EntropyValidationError {
         invalid_value_with_range(
             "validate_root_tag",
             "root_tag",
-            format!("{} characters", actual),
-            format!("minimum {} for 256-bit security", minimum),
+            format!("{actual} characters"),
+            format!("minimum {minimum} for 256-bit security"),
             "Root tag too short",
         )
     }
@@ -434,7 +433,7 @@ impl EntropyValidationError {
         invalid_value(
             "validate_root_tag",
             "root_tag",
-            format!("Root tag must be valid hex encoding: {}", error),
+            format!("Root tag must be valid hex encoding: {error}"),
         )
     }
 }
@@ -453,9 +452,8 @@ impl PolicyValidationError {
         validation_failed(
             "validate_policy",
             format!(
-                "Custom condition '{}' not in registered_custom_conditions. \
-                 Register it to prevent policy injection attacks.",
-                condition_name
+                "Custom condition '{condition_name}' not in registered_custom_conditions. \
+                 Register it to prevent policy injection attacks."
             ),
         )
     }
@@ -465,7 +463,7 @@ impl PolicyValidationError {
     pub fn duplicate_severity(severity: &str) -> AgentError {
         validation_failed(
             "validate_policy",
-            format!("Duplicate response rule for severity: {}", severity),
+            format!("Duplicate response rule for severity: {severity}"),
         )
     }
 }

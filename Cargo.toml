@@ -1,6 +1,6 @@
 [package]
 name = "palisade-config"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.90"
 authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
@@ -20,7 +20,7 @@ readme = "README.md"
 
 [dependencies]
 # Palisade ecosystem
-palisade-errors = "0.3.0"
+palisade-errors = "1.0.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -39,7 +39,7 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 # Platform detection
 cfg-if = "1.0"
 libc = "0.2.180"
-tokio = { version = "1.49.0", features = ["fs", "macros", "rt"] }
+tokio = { version = "1.49.0", features = ["fs", "macros", "rt", "rt-multi-thread"] }
 heapless = "0.9.1"
 
 [dev-dependencies]
@@ -57,7 +57,37 @@ default = []
 # EXAMPLES
 # ============================================================================
 
+[[example]]
+name = "basics"
+path = "examples/basic_defaults.rs"
 
+[[example]]
+name = "toml_loading"
+path = "examples/toml_loading.rs"
+
+[[example]]
+name = "hot_paths"
+path = "examples/runtime_hot_paths.rs"
+
+[[example]]
+name = "derivation"
+path = "examples/tag_derivation.rs"
+
+[[example]]
+name = "diffing"
+path = "examples/diffing.rs"
+
+[[example]]
+name = "advanced_policy"
+path = "examples/advanced_policy.rs"
+
+[[example]]
+name = "timing"
+path = "examples/timing_profile.rs"
+
+[[example]]
+name = "full"
+path = "examples/full_integration.rs"
 
 # ============================================================================
 # BENCHMARKS
