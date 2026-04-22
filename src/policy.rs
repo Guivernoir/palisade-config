@@ -1,15 +1,25 @@
 //! Policy configuration for honeypot decision-making.
 
-use crate::defaults::{default_policy_version, default_correlation_window, default_alert_threshold, default_max_events, default_true, default_business_hours_start, default_business_hours_end, default_artifact_access_weight, default_suspicious_process_weight, default_rapid_enum_weight, default_off_hours_weight, default_ancestry_suspicious_weight, default_cooldown, default_max_kills};
-use crate::errors::{self, PolicyValidationError, RangeValidationError};
-use crate::timing::{enforce_operation_min_timing, TimingOperation};
-use crate::POLICY_VERSION;
-use palisade_errors::Result;
+use crate::defaults::{
+    default_alert_threshold, default_ancestry_suspicious_weight, default_artifact_access_weight,
+    default_business_hours_end, default_business_hours_start, default_cooldown,
+    default_correlation_window, default_max_events, default_max_kills, default_off_hours_weight,
+    default_policy_version, default_rapid_enum_weight, default_suspicious_process_weight,
+    default_true,
+};
+use crate::secure_fs::{RestrictedInputKind, read_restricted_file};
+use crate::timing::{TimingOperation, enforce_operation_min_timing};
+use crate::{AgentError, POLICY_VERSION, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
+const CFG_PARSE_FAILED: u16 = 100;
+const CFG_VALIDATION_FAILED: u16 = 101;
+const CFG_MISSING_REQUIRED: u16 = 102;
+const CFG_INVALID_VALUE: u16 = 103;
+const CFG_VERSION_MISMATCH: u16 = 106;
 /// Policy configuration - the DECISION PLANE of your security operation.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolicyConfig {
@@ -141,29 +151,50 @@ pub struct ResponseRule {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseCondition {
     /// Confidence score must exceed threshold
-    MinConfidence { threshold: f64 },
+    MinConfidence {
+        /// Minimum confidence score required for the condition to match.
+        threshold: f64,
+    },
 
     /// Process must not be child of specific parent
-    NotParentedBy { process_name: String },
+    NotParentedBy {
+        /// Parent process name that disqualifies the action when matched.
+        process_name: String,
+    },
 
     /// Incident must involve multiple distinct signals
-    MinSignalTypes { count: usize },
+    MinSignalTypes {
+        /// Minimum number of distinct signals required for the condition to match.
+        count: usize,
+    },
 
     /// Repeated incidents within time window
-    RepeatCount { count: usize, window_secs: u64 },
+    RepeatCount {
+        /// Minimum number of repeated incidents required within the time window.
+        count: usize,
+        /// Window size, in seconds, used for the repeat-count check.
+        window_secs: u64,
+    },
 
     /// Current time must be within window (24-hour clock)
-    TimeWindow { start_hour: u8, end_hour: u8 },
+    TimeWindow {
+        /// Inclusive start hour for the allowed 24-hour window.
+        start_hour: u8,
+        /// Exclusive end hour for the allowed 24-hour window.
+        end_hour: u8,
+    },
 
     /// Custom condition (MUST be pre-registered)
     Custom {
+        /// Registered custom-condition identifier.
         name: String,
+        /// String parameters passed to the custom-condition evaluator.
         params: HashMap<String, String>,
     },
 }
 
 /// Incident severity level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Severity {
     /// Low severity (informational)
@@ -204,7 +235,7 @@ impl std::fmt::Display for Severity {
 }
 
 /// Action type for incident response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionType {
     /// Log the incident
@@ -216,7 +247,10 @@ pub enum ActionType {
     /// Isolate the host from network
     IsolateHost,
     /// Execute custom script
-    CustomScript { path: PathBuf },
+    CustomScript {
+        /// Absolute path to the custom script to execute.
+        path: PathBuf,
+    },
 }
 
 /// Deception detection policy.
@@ -232,7 +266,9 @@ pub struct DeceptionPolicy {
 }
 
 /// Deserialize Vec<String>, normalize to lowercase, and convert to Box<[String]> for memory efficiency.
-fn deserialize_lowercase_boxed<'de, D>(deserializer: D) -> std::result::Result<Box<[String]>, D::Error>
+fn deserialize_lowercase_boxed<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Box<[String]>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -259,41 +295,38 @@ impl PolicyConfig {
         let started = Instant::now();
         let path = path.as_ref();
         let result = async {
-            let contents = tokio::fs::read_to_string(path)
-                .await
-                .map_err(|e| errors::io_read_error("load_policy", path, e))?;
-
-            let policy: PolicyConfig = toml::from_str(&contents).map_err(|e| {
-                errors::parse_error("parse_policy_toml", format!("Policy TOML syntax error: {e}"))
-            })?;
-
-            // Version validation
-            if policy.version > POLICY_VERSION {
-                return Err(errors::version_error(
-                    "validate_policy_version",
-                    policy.version,
-                    POLICY_VERSION,
-                    format!(
-                        "Policy version too new (agent: {}, policy: {}). Upgrade agent",
-                        POLICY_VERSION, policy.version
-                    ),
-                ));
-            }
-
-            if policy.version < POLICY_VERSION {
-                eprintln!(
-                    "WARNING: Policy version is older (policy: {}, agent: {}). Consider updating.",
-                    policy.version, POLICY_VERSION
-                );
-            }
-
-            policy.validate()?;
-
-            Ok(policy)
+            let contents = read_restricted_file(path, RestrictedInputKind::Policy).await?;
+            Self::from_toml_str(&contents)
         }
         .await;
         enforce_operation_min_timing(started, TimingOperation::PolicyLoad);
         result
+    }
+
+    pub(crate) fn from_toml_str(contents: &str) -> Result<Self> {
+        let policy: PolicyConfig = toml::from_str(contents).map_err(|e| {
+            AgentError::new(
+                CFG_PARSE_FAILED,
+                "Configuration input could not be parsed",
+                format!("operation=parse_policy_toml; Policy TOML syntax error: {e}"),
+                "",
+            )
+        })?;
+
+        if policy.version > POLICY_VERSION {
+            return Err(AgentError::new(
+                CFG_VERSION_MISMATCH,
+                "Configuration version is not supported",
+                format!(
+                    "operation=validate_policy_version; Policy version too new (agent: {POLICY_VERSION}, policy: {}). Upgrade agent; file_version={}; expected_version={POLICY_VERSION}",
+                    policy.version, policy.version
+                ),
+                "",
+            ));
+        }
+
+        policy.validate()?;
+        Ok(policy)
     }
 
     /// Validate policy configuration.
@@ -302,69 +335,96 @@ impl PolicyConfig {
         let result = (|| {
             // Validate scoring policy
             if !(0.0..=100.0).contains(&self.scoring.alert_threshold) {
-                return Err(RangeValidationError::out_of_range(
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    format!(
+                        "operation=validate_policy_scoring; field=scoring.alert_threshold; reason=scoring.alert_threshold must be within valid range; actual_value={}; expected_range=0-100",
+                        self.scoring.alert_threshold
+                    ),
                     "scoring.alert_threshold",
-                    self.scoring.alert_threshold,
-                    0.0,
-                    100.0,
-                    "validate_policy_scoring",
                 ));
             }
 
             if self.scoring.correlation_window_secs == 0
                 || self.scoring.correlation_window_secs > 3600
             {
-                return Err(RangeValidationError::out_of_range(
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    format!(
+                        "operation=validate_policy_scoring; field=scoring.correlation_window_secs; reason=scoring.correlation_window_secs must be within valid range; actual_value={}; expected_range=1-3600",
+                        self.scoring.correlation_window_secs
+                    ),
                     "scoring.correlation_window_secs",
-                    self.scoring.correlation_window_secs,
-                    1,
-                    3600,
-                    "validate_policy_scoring",
                 ));
             }
 
             // CRITICAL: Prevent memory exhaustion and invalid zero-capacity buffers.
             if self.scoring.max_events_in_memory == 0 || self.scoring.max_events_in_memory > 100_000
             {
-                return Err(RangeValidationError::out_of_range(
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    format!(
+                        "operation=validate_policy_scoring; field=scoring.max_events_in_memory; reason=scoring.max_events_in_memory must be within valid range; actual_value={}; expected_range=1-100000",
+                        self.scoring.max_events_in_memory
+                    ),
                     "scoring.max_events_in_memory",
-                    self.scoring.max_events_in_memory,
-                    1,
-                    100_000,
-                    "validate_policy_scoring",
                 ));
             }
 
             // Validate response policy
             if self.response.rules.is_empty() {
-                return Err(errors::missing_required(
-                    "validate_policy_response",
+                return Err(AgentError::new(
+                    CFG_MISSING_REQUIRED,
+                    "Required configuration is missing",
+                    "operation=validate_policy_response; response.rules cannot be empty; impact=no_response_actions",
                     "response.rules",
-                    "no_response_actions",
                 ));
             }
 
             if self.response.cooldown_secs == 0 {
-                return Err(errors::invalid_value(
-                    "validate_policy_response",
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    "operation=validate_policy_response; field=response.cooldown_secs; response.cooldown_secs cannot be zero",
                     "response.cooldown_secs",
-                    "response.cooldown_secs cannot be zero",
                 ));
             }
 
             // Check for duplicate severity mappings
-            let mut seen = HashSet::new();
-            for rule in &self.response.rules {
-                if !seen.insert(rule.severity) {
-                    return Err(PolicyValidationError::duplicate_severity(&rule.severity.to_string()));
+            for idx in 0..self.response.rules.len() {
+                for prev in 0..idx {
+                    if self.response.rules[idx].severity == self.response.rules[prev].severity {
+                        return Err(AgentError::new(
+                            CFG_VALIDATION_FAILED,
+                            "Configuration validation failed",
+                            format!(
+                                "operation=validate_policy; Duplicate response rule for severity: {}",
+                                self.response.rules[idx].severity
+                            ),
+                            "",
+                        ));
+                    }
                 }
+
+                let rule = &self.response.rules[idx];
 
                 // Validate custom conditions against whitelist
                 for condition in &rule.conditions {
                     if let ResponseCondition::Custom { name, .. } = condition
-                        && !self.registered_custom_conditions.contains(name) {
-                            return Err(PolicyValidationError::unregistered_condition(name));
-                        }
+                        && !self.registered_custom_conditions.contains(name)
+                    {
+                        return Err(AgentError::new(
+                            CFG_VALIDATION_FAILED,
+                            "Configuration validation failed",
+                            format!(
+                                "operation=validate_policy; Custom condition '{name}' not in registered_custom_conditions. Register it to prevent policy injection attacks."
+                            ),
+                            "",
+                        ));
+                    }
                 }
             }
 
@@ -506,7 +566,10 @@ mod tests {
     #[test]
     fn test_custom_condition_validation() {
         let mut policy = PolicyConfig::default();
-        policy.response.rules.retain(|r| r.severity != Severity::Medium);
+        policy
+            .response
+            .rules
+            .retain(|r| r.severity != Severity::Medium);
 
         policy.response.rules.push(ResponseRule {
             severity: Severity::Medium,
@@ -519,7 +582,9 @@ mod tests {
 
         assert!(policy.validate().is_err());
 
-        policy.registered_custom_conditions.insert("unregistered".to_string());
+        policy
+            .registered_custom_conditions
+            .insert("unregistered".to_string());
         assert!(policy.validate().is_ok());
     }
 

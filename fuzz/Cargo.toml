@@ -1,0 +1,29 @@
+[package]
+name = "palisade-config-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.palisade-config]
+path = ".."
+
+[[bin]]
+name = "config_from_toml"
+path = "fuzz_targets/config_from_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_from_toml"
+path = "fuzz_targets/policy_from_toml.rs"
+test = false
+doc = false
+bench = false
+

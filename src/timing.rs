@@ -1,20 +1,13 @@
-//! Centralized timing-profile controls for constant-time floor normalization.
+//! Centralized timing-floor controls for public-path normalization.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Runtime timing profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TimingProfile {
-    /// Lower latency with moderate timing smoothing.
-    Balanced = 0,
-    /// Higher latency with stronger timing smoothing.
-    Hardened = 1,
-}
+/// Default minimum duration applied to public operations.
+pub const DEFAULT_TIMING_FLOOR: Duration = Duration::from_micros(50);
 
-/// Internal operation kinds with dedicated timing floors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Internal operation kinds that participate in timing-floor enforcement.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TimingOperation {
     ConfigLoad,
     ConfigValidateStandard,
@@ -36,71 +29,23 @@ pub(crate) enum TimingOperation {
     PolicyCustomConditionCheck,
 }
 
-static TIMING_PROFILE: AtomicU8 = AtomicU8::new(TimingProfile::Balanced as u8);
+static TIMING_FLOOR_NANOS: AtomicU64 = AtomicU64::new(DEFAULT_TIMING_FLOOR.as_nanos() as u64);
 
-/// Set global timing profile for constant-time floor normalization.
-pub fn set_timing_profile(profile: TimingProfile) {
-    TIMING_PROFILE.store(profile as u8, Ordering::Relaxed);
+/// Set the global minimum duration for public operations in this crate.
+pub fn set_timing_floor(floor: Duration) {
+    let nanos = floor.as_nanos().min(u128::from(u64::MAX)) as u64;
+    TIMING_FLOOR_NANOS.store(nanos, Ordering::Relaxed);
 }
 
-/// Get current global timing profile.
+/// Get the current global minimum duration for public operations.
 #[must_use]
-pub fn get_timing_profile() -> TimingProfile {
-    match TIMING_PROFILE.load(Ordering::Relaxed) {
-        1 => TimingProfile::Hardened,
-        _ => TimingProfile::Balanced,
-    }
+pub fn get_timing_floor() -> Duration {
+    Duration::from_nanos(TIMING_FLOOR_NANOS.load(Ordering::Relaxed))
 }
 
 #[inline]
-const fn timing_floor(profile: TimingProfile, op: TimingOperation) -> Duration {
-    match profile {
-        TimingProfile::Balanced => match op {
-            TimingOperation::ConfigLoad => Duration::from_micros(30),
-            TimingOperation::ConfigValidateStandard => Duration::from_micros(12),
-            TimingOperation::ConfigValidateStrict => Duration::from_micros(16),
-            TimingOperation::ConfigHostname => Duration::from_micros(2),
-            TimingOperation::ConfigDiff => Duration::from_micros(8),
-            TimingOperation::PolicyLoad => Duration::from_micros(30),
-            TimingOperation::PolicyValidate => Duration::from_micros(12),
-            TimingOperation::PolicyDiff => Duration::from_micros(8),
-            TimingOperation::PolicySuspiciousCheckLegacy => Duration::from_micros(8),
-            TimingOperation::RuntimeConfigBuild => Duration::from_micros(10),
-            TimingOperation::RuntimePolicyBuild => Duration::from_micros(10),
-            TimingOperation::RootTagNew => Duration::from_micros(18),
-            TimingOperation::RootTagGenerate => Duration::from_micros(18),
-            TimingOperation::RootTagDeriveHost => Duration::from_micros(8),
-            TimingOperation::RootTagDeriveArtifact => Duration::from_micros(12),
-            TimingOperation::RootTagHashCompare => Duration::from_micros(1),
-            TimingOperation::PolicySuspiciousCheck => Duration::from_micros(8),
-            TimingOperation::PolicyCustomConditionCheck => Duration::from_micros(4),
-        },
-        TimingProfile::Hardened => match op {
-            TimingOperation::ConfigLoad => Duration::from_micros(45),
-            TimingOperation::ConfigValidateStandard => Duration::from_micros(18),
-            TimingOperation::ConfigValidateStrict => Duration::from_micros(24),
-            TimingOperation::ConfigHostname => Duration::from_micros(4),
-            TimingOperation::ConfigDiff => Duration::from_micros(12),
-            TimingOperation::PolicyLoad => Duration::from_micros(45),
-            TimingOperation::PolicyValidate => Duration::from_micros(18),
-            TimingOperation::PolicyDiff => Duration::from_micros(12),
-            TimingOperation::PolicySuspiciousCheckLegacy => Duration::from_micros(12),
-            TimingOperation::RuntimeConfigBuild => Duration::from_micros(16),
-            TimingOperation::RuntimePolicyBuild => Duration::from_micros(16),
-            TimingOperation::RootTagNew => Duration::from_micros(28),
-            TimingOperation::RootTagGenerate => Duration::from_micros(28),
-            TimingOperation::RootTagDeriveHost => Duration::from_micros(12),
-            TimingOperation::RootTagDeriveArtifact => Duration::from_micros(18),
-            TimingOperation::RootTagHashCompare => Duration::from_micros(2),
-            TimingOperation::PolicySuspiciousCheck => Duration::from_micros(12),
-            TimingOperation::PolicyCustomConditionCheck => Duration::from_micros(6),
-        },
-    }
-}
-
-#[inline]
-pub(crate) fn enforce_operation_min_timing(started: Instant, op: TimingOperation) {
-    let target = started + timing_floor(get_timing_profile(), op);
+pub(crate) fn enforce_operation_min_timing(started: Instant, _op: TimingOperation) {
+    let target = started + get_timing_floor();
     while Instant::now() < target {
         std::hint::spin_loop();
     }
@@ -111,10 +56,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn profile_roundtrip() {
-        set_timing_profile(TimingProfile::Balanced);
-        assert_eq!(get_timing_profile(), TimingProfile::Balanced);
-        set_timing_profile(TimingProfile::Hardened);
-        assert_eq!(get_timing_profile(), TimingProfile::Hardened);
+    fn timing_floor_roundtrip() {
+        set_timing_floor(Duration::from_micros(25));
+        assert_eq!(get_timing_floor(), Duration::from_micros(25));
+        set_timing_floor(DEFAULT_TIMING_FLOOR);
+        assert_eq!(get_timing_floor(), DEFAULT_TIMING_FLOOR);
     }
 }

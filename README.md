@@ -1,225 +1,404 @@
 # palisade-config
 
-Security-focused configuration and policy crate for deception/honeypot systems.
+Security-focused configuration and policy management for deception, honeypot, and high-scrutiny telemetry deployments.
 
 [![Crates.io](https://img.shields.io/crates/v/palisade-config.svg)](https://crates.io/crates/palisade-config)
 [![Documentation](https://docs.rs/palisade-config/badge.svg)](https://docs.rs/palisade-config)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-## What this crate provides
+## Abstract
 
-- Typed `Config` and `PolicyConfig` models with multi-layer validation
-- Cryptographic tag derivation via `RootTag` (SHA3-512 hierarchy)
-- Runtime no-allocation representations (`RuntimeConfig`, `RuntimePolicy`)
-- Centralized timing-floor profiles (`TimingProfile::Balanced` / `Hardened`)
-- Config/policy diffing for safe hot-reload workflows
-- Security-oriented error model via `palisade-errors`
+`palisade-config` is a deliberately narrow crate for loading, validating,
+normalizing, and operationalizing sensitive configuration inputs in hostile or
+high-observation environments. The design target is not generic application
+configuration. It is the smaller and more demanding class of systems in which
+configuration files themselves influence the attack surface: honeypots, decoy
+infrastructure, deception agents, and tightly monitored detection pipelines.
 
-## Version
+The crate centers its public operational surface on two types:
 
-Current crate version: `1.0.2`
+- `ConfigApi` for infrastructure mechanics
+- `PolicyApi` for detection and response policy
+
+Those APIs embed validation into their load paths, support caller-selected
+timing floors, and optionally route audit persistence through the encrypted log
+path provided by `palisade-errors`.
+
+## Positioning
+
+This crate is a good fit when the following properties matter:
+
+- configuration files contain security-sensitive material
+- public-path timing behavior should be normalized to a minimum floor
+- runtime hot paths should avoid heap allocation after startup conversion
+- diffing and hot-reload review should expose structural changes without leaking
+  secrets
+- encrypted error and audit persistence should remain explicit and opt-in
+
+It is a poor fit when the following priorities dominate:
+
+- generic application settings with low security sensitivity
+- derive-heavy integration with broad configuration ecosystems
+- ergonomic error chaining across many third-party libraries
+- unrestricted dynamic runtime structures with no fixed-capacity boundaries
+
+## Public Interface
+
+The preferred operational entry points are:
+
+- `ConfigApi::new()`
+- `PolicyApi::new()`
+- `ConfigApi::load_runtime_file(...)` / `load_runtime_str(...)` for hardened,
+  fixed-capacity admission directly into runtime config
+- `PolicyApi::load_runtime_file(...)` / `load_runtime_str(...)` for hardened,
+  fixed-capacity admission directly into runtime policy
+
+The underlying typed models remain public for serialization, inspection, and
+direct manipulation:
+
+- `Config`
+- `PolicyConfig`
+- `RuntimeConfig`
+- `RuntimePolicy`
+- `RootTag`
+
+The intended usage model is:
+
+1. In high-risk production, load directly through the hardened runtime methods
+2. Otherwise, load through `ConfigApi` / `PolicyApi`
+3. Convert once to `RuntimeConfig` / `RuntimePolicy`
+4. Operate on the runtime forms in hot paths
+
+## Security Properties
+
+### 1. Restricted Input Handling
+
+On Unix platforms, configuration and policy files are opened through a
+restricted loader that:
+
+- rejects symlink inputs
+- requires a regular file
+- enforces owner-only permissions (`0o600` minimum policy)
+- performs permission validation before content is admitted into the crate
+
+On non-Unix platforms, the crate now fails closed for on-disk restricted file
+admission. In a hardened deployment, `load_file(...)` is therefore a Unix-only
+path unless the crate is redesigned around a platform-native trust model.
+
+### 2. Embedded Validation
+
+`ConfigApi` and `PolicyApi` embed validation into their load methods. In normal
+use, a successful load already means parse plus validation succeeded.
+
+Validation covers:
+
+- schema/version compatibility
+- required-field presence
+- absolute-path requirements where applicable
+- root-tag entropy heuristics
+- range and capacity checks
+- pre-registration of custom policy conditions
+
+### 3. Runtime No-Allocation Path
+
+`load_runtime_*()` and `to_runtime()` convert configuration into fixed-capacity
+runtime types backed by `heapless`. After conversion, the hot-path primitives
+are designed to avoid heap allocation and to avoid cloning long-lived secret
+state.
+
+The operational diff APIs also follow this model. `ConfigApi::diff(...)` and
+`PolicyApi::diff(...)` now return borrowed, fixed-capacity reports instead of
+allocating owned change sets.
+
+For the compatibility loaders returning `Config` and `PolicyConfig`, this
+guarantee does not apply to the load, deserialize, or validation stages because
+those paths still materialize owned models.
+
+For the hardened runtime loaders, the crate uses bounded file admission plus
+fixed-capacity admitted types before moving directly into runtime structures.
+
+### 4. Timing-Floor Normalization
+
+Security-sensitive public operations use minimum execution floors to reduce
+coarse timing discrimination.
+
+The crate exposes:
+
+- `DEFAULT_TIMING_FLOOR`
+- `set_timing_floor(...)`
+- `get_timing_floor()`
+- `ConfigApi::with_timing_floor(...)`
+- `PolicyApi::with_timing_floor(...)`
+
+These floors reduce observable timing skew. They do not constitute a complete
+side-channel proof.
+
+### 5. Encrypted Log Persistence
+
+When `feature = "log"` is enabled, this crate does not implement a separate log
+encryption scheme of its own. Instead, it delegates persistence to
+`palisade-errors::AgentError::log(...)`.
+
+That matters operationally:
+
+- persisted records are encrypted through the same hardened path used by
+  `palisade-errors`
+- the cryptographic implementation is inherited from that crate
+- the underlying encrypted sink uses `crypto_bastion 0.4.0` through
+  `palisade-errors`
+
+In other words: yes, encrypted log persistence is applied, but it is applied by
+delegation rather than by duplicating the encryption stack in this crate.
 
 ## Installation
 
 ```toml
 [dependencies]
-palisade-config = "1.0.2"
+palisade-config = "2.0.0"
 ```
 
-## Prerequisites: file permissions
+Enable encrypted log persistence and action logging:
 
-`Config::from_file` and `PolicyConfig::from_file` enforce Unix file permissions
-before reading. Config and policy files **must** be `0o600` (owner read/write only):
-
-```bash
-chmod 600 config.toml
-chmod 600 policy.toml
+```toml
+[dependencies]
+palisade-config = { version = "2.0.0", features = ["log"] }
 ```
 
-Any other permission mode (e.g. default `0o644`) will return a security violation
-error before any content is read. This is enforced, not optional.
+## Quick Start
 
-## Quick start
+### 1. Provision a Root Tag
 
-### 1) Generate a root tag
-
-The `root_tag` field in `config.toml` requires a 64-character hex-encoded 256-bit secret
-with sufficient entropy (non-zero, non-sequential, ≥25% unique bytes):
+The `root_tag` field is a 64-character hex-encoded 256-bit secret.
 
 ```bash
 openssl rand -hex 32
 ```
 
-Paste the output into your `config.toml` as the `root_tag` value.
+Treat the resulting value as high-sensitivity material.
 
-### 2) Load and validate config/policy
-
-`from_file` runs standard validation automatically. Calling `validate()` again is
-redundant — it is only needed when validating a config constructed in-process
-(e.g. from `Config::default()` or after manual field mutation).
+### 2. Load Config and Policy
 
 ```rust
-use palisade_config::{Config, PolicyConfig};
+use palisade_config::{ConfigApi, PolicyApi, ValidationMode};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> palisade_config::Result<()> {
-    // Loads, deserializes, and validates in one call.
-    let cfg = Config::from_file("./config.toml").await?;
-    let policy = PolicyConfig::from_file("./policy.toml").await?;
+    let config_api = ConfigApi::new().with_validation_mode(ValidationMode::Strict);
+    let policy_api = PolicyApi::new();
 
-    println!("Config v{} / Policy v{}", cfg.version, policy.version);
+    let config = config_api.load_file("./config.toml").await?;
+    let policy = policy_api.load_file("./policy.toml").await?;
+
+    println!("config={} policy={}", config.version, policy.version);
     Ok(())
 }
 ```
 
-For strict validation (paths must exist, log directory must be writable):
+### 3. Hardened Production Load
 
 ```rust
-use palisade_config::{Config, ValidationMode};
+use palisade_config::{ConfigApi, PolicyApi, ValidationMode};
 
-let cfg = Config::from_file_with_mode("./config.toml", ValidationMode::Strict).await?;
-```
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> palisade_config::Result<()> {
+    let config_api = ConfigApi::new().with_validation_mode(ValidationMode::Strict);
+    let policy_api = PolicyApi::new();
 
-### 3) Convert to runtime no-alloc mode
-
-```rust
-use palisade_config::Config;
-
-fn main() -> palisade_config::Result<()> {
-    let cfg = Config::default();
-    let runtime = cfg.to_runtime()?;
+    let runtime_config = config_api.load_runtime_file("./config.toml").await?;
+    let runtime_policy = policy_api.load_runtime_file("./policy.toml").await?;
 
     let mut tag_hex = [0u8; 128];
-    runtime.derive_artifact_tag_hex_into("artifact-001", &mut tag_hex);
-    // tag_hex now contains the lowercase hex digest — no heap allocation
-
+    runtime_config.derive_artifact_tag_hex_into("artifact-001", &mut tag_hex);
+    assert!(!runtime_policy.is_suspicious_process("svchost.exe"));
     Ok(())
 }
 ```
 
-### 4) Policy checks at runtime
+### 4. Convert Once for Runtime Use
 
 ```rust
-use palisade_config::PolicyConfig;
+use palisade_config::{ConfigApi, PolicyApi};
 
-fn main() -> palisade_config::Result<()> {
-    let policy = PolicyConfig::default();
-    let runtime = policy.to_runtime()?;
+fn prepare(
+    config_api: &ConfigApi,
+    policy_api: &PolicyApi,
+    config: &palisade_config::Config,
+    policy: &palisade_config::PolicyConfig,
+) -> palisade_config::Result<()> {
+    let runtime_config = config_api.to_runtime(config)?;
+    let runtime_policy = policy_api.to_runtime(policy)?;
 
-    // ASCII case-insensitive substring match, no heap allocation
-    assert!(runtime.is_suspicious_process("MIMIKATZ.exe"));
-    assert!(!runtime.is_suspicious_process("svchost.exe"));
-
+    let mut tag_hex = [0u8; 128];
+    runtime_config.derive_artifact_tag_hex_into("artifact-001", &mut tag_hex);
+    assert!(!runtime_policy.is_suspicious_process("svchost.exe"));
     Ok(())
 }
 ```
 
-### 5) Hot-reload via diff
-
-Diff exposes only what changed — safe to apply, log, or reject at your discretion:
+### 5. Configure Timing Floors
 
 ```rust
-use palisade_config::{Config, PolicyConfig};
-
-fn hot_reload(
-    current_cfg: &Config,
-    new_cfg: &Config,
-    current_policy: &PolicyConfig,
-    new_policy: &PolicyConfig,
-) {
-    let cfg_changes = current_cfg.diff(new_cfg);
-    let policy_changes = current_policy.diff(new_policy);
-
-    for change in &cfg_changes {
-        println!("{change:?}");
-    }
-    // Root tag changes surface as hash prefix only — secret never exposed in diff output
-}
-```
-
-### 6) Set timing profile
-
-```rust
-use palisade_config::{set_timing_profile, TimingProfile};
+use palisade_config::{DEFAULT_TIMING_FLOOR, set_timing_floor};
+use std::time::Duration;
 
 fn main() {
-    // Use Hardened in hostile environments; Balanced when latency budget is tight
-    set_timing_profile(TimingProfile::Hardened);
+    set_timing_floor(DEFAULT_TIMING_FLOOR.max(Duration::from_micros(250)));
 }
 ```
+
+### 6. Enable Encrypted Audit Persistence
+
+```rust
+use palisade_config::{ConfigApi, PolicyApi};
+use std::path::Path;
+
+let config_api = ConfigApi::new()
+    .with_log_path(Path::new("/var/log/palisade/config.audit.log"))
+    .log_errors(true)
+    .log_loads(true)
+    .log_validations(true)
+    .log_runtime_builds(true)
+    .log_diffs(true);
+
+let policy_api = PolicyApi::new()
+    .with_log_path(Path::new("/var/log/palisade/policy.audit.log"))
+    .log_errors(true)
+    .log_loads(true)
+    .log_validations(true)
+    .log_runtime_builds(true)
+    .log_diffs(true)
+    .log_checks(true);
+```
+
+Notes:
+
+- log paths should be absolute
+- encrypted persistence is delegated to `AgentError::log(...)`
+- enabled encrypted audit persistence fails closed across the operational API
+  surface if the write cannot be completed
+- action logging is opt-in per action category
+- error logging is enabled automatically by `with_log_path(...)`
+- the hardened runtime loaders are the recommended production path when you need
+  bounded admission before runtime construction
+
+## Validation Modes
+
+`ValidationMode::Standard`
+
+- parse and structural validation
+- no extra filesystem assertions beyond loading the file itself
+- suitable for CI, test harnesses, or incomplete staging layouts
+
+`ValidationMode::Strict`
+
+- all Standard checks
+- existence checks for monitored filesystem targets
+- parent-directory checks for writable logging destinations
+- appropriate for production deployments with known-good filesystem layouts
 
 ## Architecture
 
-### Config vs policy
+### Config vs Policy
 
-| | `Config` | `PolicyConfig` |
+| Surface | Primary Concern | Example Contents |
 |---|---|---|
-| Purpose | Infrastructure mechanics | Detection/response logic |
-| Contains | Paths, logging, telemetry, root tag | Thresholds, rules, suspicious patterns |
-| Secret material | Yes (`RootTag`) | No |
-| File sensitivity | High | Medium |
+| `Config` | infrastructure mechanics | working directories, watch paths, root tag, logging path |
+| `PolicyConfig` | detection and response logic | thresholds, suspicious processes, response rules |
 
-### Validation modes
+### Runtime Model
 
-`Standard` (default via `from_file`): format checks, range checks, entropy checks.
-No filesystem access beyond reading the config file itself.
+The crate distinguishes between admission-time and runtime-time structures:
 
-`Strict` (via `from_file_with_mode`): all Standard checks plus path existence,
-parent directory existence, and log directory write-access verification.
-Use in production; `Standard` is appropriate for CI environments where
-monitored paths may not exist.
+- admission-time: flexible deserialized models
+- runtime-time: fixed-capacity, no-allocation operational structures
 
-### Runtime no-alloc layer
+This separation keeps the operational hot path narrow and bounded without
+forcing the loading path to become artificially inflexible.
 
-`to_runtime()` converts deserialized models into fixed-capacity runtime types
-backed by `heapless`. All hot-path operations on `RuntimeConfig` and `RuntimePolicy`
-are designed for zero heap allocation.
-
-Fixed capacities (see `runtime.rs`):
-
-| Constant | Default |
-|---|---|
-| `MAX_PATH_LEN` | 512 bytes |
-| `MAX_LABEL_LEN` | 64 bytes |
-| `MAX_PATH_ENTRIES` | 64 |
-| `MAX_CREDENTIAL_TYPES` | 32 |
-| `MAX_SUSPICIOUS_PROCESSES` | 128 |
-| `MAX_SUSPICIOUS_PATTERNS` | 128 |
-| `MAX_CUSTOM_CONDITIONS` | 128 |
-
-### Cryptographic tag hierarchy
+### Tag Derivation
 
 ```
 root_tag (256-bit secret)
-    └── host_tag  = SHA3-512(root_tag || hostname)
-            └── artifact_tag = SHA3-512(host_tag || artifact_id)
+    -> host_tag = SHA3-512(root_tag || hostname)
+    -> artifact_tag = SHA3-512(host_tag || artifact_id)
 ```
 
-Tags are deterministic — same inputs always produce the same tag. Rotating the
-root tag breaks all artifact correlations simultaneously.
+The design goal is stable per-host derivation with correlation resistance across
+unrelated artifacts and straightforward invalidation through root-tag rotation.
 
-### Timing model
+## Operational Guidance
 
-All security-sensitive operations have minimum execution floors applied via
-`enforce_operation_min_timing`. This reduces coarse timing side-channel leakage;
-it is not a full side-channel proof (see SECURITY.md).
+### Recommended Deployment Posture
 
-| Profile | Use case |
-|---|---|
-| `Balanced` (default) | Lower latency, moderate smoothing |
-| `Hardened` | Higher floors, stronger timing smoothing |
+For a high-risk honeypot deployment:
+
+- use `ValidationMode::Strict`
+- treat config and policy files as privileged assets
+- keep files owner-only on Unix
+- convert to runtime forms at startup, not lazily
+- enable encrypted error and audit logging explicitly
+- enable action logging only for the events you genuinely need to retain
+- benchmark timing-floor choices against your real event volume
+
+### Recommended Verification Workflow
+
+```bash
+cargo fmt --all
+cargo test
+cargo test --features log
+cargo check --all-targets --all-features
+cargo audit
+cargo deny check
+```
+
+For higher assurance, add:
+
+- reproducible CI builds
+- scheduled dependency and supply-chain review
+- fuzzing for parse and validation boundaries
+- deployment-environment benchmarking for timing floors
+
+Smoke-test fuzzing with:
+
+```bash
+cargo install cargo-fuzz --locked
+cargo fuzz run config_from_toml -- -max_total_time=20
+cargo fuzz run policy_from_toml -- -max_total_time=20
+```
+
+## Limitations
+
+This crate should be adopted with the following limits in mind:
+
+- timing floors reduce coarse timing leakage only
+- hardened on-disk restricted loading is Unix-only and now fails closed on
+  non-Unix platforms
+- encrypted log persistence is delegated, not independently reimplemented here
+- the crate does not protect against root-level host compromise
+- plaintext config files still contain the serialized `root_tag`
+- the compatibility loaders returning `Config` and `PolicyConfig` still use
+  owned deserialized models
+- the hardened runtime loaders close that boundary for production runtime
+  admission, but they require the stricter fixed-capacity schema shape
+- a strict no-trust posture still depends on operator controls, dependency
+  review, and host hardening outside this crate
 
 ## Examples
 
-See `examples/`:
+Runnable examples are available under `examples/`:
 
-- `toml_loading.rs` — load config and policy from TOML files, validate, run policy checks
-- `full.rs` — full integration: startup, runtime conversion, tag binding, incident scoring, hot-reload, shutdown
+- `basics`
+- `toml_loading`
+- `hot_paths`
+- `derivation`
+- `diffing`
+- `advanced_policy`
+- `timing`
+- `full`
 
-Run with:
+Run them with:
 
 ```bash
-# Requires examples/config.toml and examples/policy.toml with chmod 600
 cargo run --example basics
 cargo run --example toml_loading
 cargo run --example hot_paths
@@ -230,13 +409,11 @@ cargo run --example timing
 cargo run --example full
 ```
 
-See `examples/config.toml` and `examples/policy.toml` for reference templates.
+## Related Documents
 
-## Benchmark analysis utility
-
-Script: `scripts/analyze_bench_results.py`
-
-Usage: `scripts/ANALYZE_BENCH_RESULTS_USAGE.md`
+- [Security Policy](SECURITY.md)
+- [Examples Guide](examples/README.md)
+- [Benchmark Analysis Script Usage](scripts/ANALYZE_BENCH_RESULTS_USAGE.md)
 
 ## License
 

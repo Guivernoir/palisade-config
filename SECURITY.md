@@ -1,224 +1,245 @@
 # Security Policy
 
-## Scope
+## Abstract
 
-`palisade-config` is a security-sensitive crate that handles:
+`palisade-config` is a security-sensitive crate intended for environments in
+which configuration and policy inputs influence a live defensive surface. This
+document describes the current guarantees, threat assumptions, operational
+requirements, reporting channel, and known limitations for the latest supported
+release.
 
-- Root cryptographic tag material
-- Infrastructure and detection policy inputs
-- Runtime decision-path checks
+## Supported Versions
 
-This document covers current guarantees, limitations, and reporting guidance.
+Security fixes are applied to the latest released version only.
 
-## Supported versions
+## Reporting Vulnerabilities
 
-Security fixes are applied to the latest released version.
+Do not report vulnerabilities through public issues.
 
-## Reporting vulnerabilities
+Send reports to:
 
-Do not open public issues for vulnerabilities.
-
-Send details to: `strukturaenterprise@gmail.com`
+- `strukturaenterprise@gmail.com`
 
 Include:
 
-- Affected version
-- Reproduction steps
-- Impact assessment
-- Suggested fix (if available)
+- affected version
+- deployment context
+- reproduction steps
+- impact assessment
+- suggested mitigation, if known
 
-## Current security model
+## Scope
 
-### 1) File permission enforcement
+This crate is responsible for:
 
-On Unix systems, `Config::from_file` and `PolicyConfig::from_file` call
-`validate_file_permissions` **before reading any content**. Files with
-`mode & 0o077 != 0` (i.e. any group or world read/write/execute bits set) are
-rejected with a security violation error. This means the minimum acceptable
-permission is `0o600`. This is enforced in code, not advisory.
+- admission of configuration and policy files
+- validation of sensitive configuration state
+- hardened fixed-capacity admission directly into runtime structures
+- derivation of runtime fixed-capacity structures
+- root-tag handling and derivation support
+- optional encrypted persistence of errors and selected audit actions
 
-On non-Unix platforms, NTFS ACL validation is assumed to be handled externally.
+This crate is not responsible for:
 
-### 2) Memory handling
+- host hardening beyond the process boundary
+- non-Unix ACL enforcement
+- secret distribution infrastructure
+- standardized secure-log interoperability formats
+- containment after kernel- or root-level compromise
 
-- Sensitive fields use zeroization (`Zeroize`, `ZeroizeOnDrop`)
-- `RootTag` secret storage is fixed-size (`[u8; 32]`), never heap-allocated
-- `ProtectedString` and `ProtectedPath` wrap selected config fields with
-  redacted `Debug` output and zeroization on drop
-- `RootTag` secret is never exposed in `Debug` output or diff results
-  (diff compares SHA3-512 hash prefix only)
+## Threat Model
 
-### 3) Cryptographic derivation
+The relevant attacker may:
 
-SHA3-512 based derivation hierarchy:
+- influence or replace configuration files on disk
+- attempt symlink substitution or path redirection
+- observe error messages and public-path timing
+- obtain crash output or residual process memory after compromise
+- access persisted log files without live process memory
 
+The crate attempts to reduce information leakage and unsafe file admission at
+the process boundary. It does not claim to secure a compromised host or to
+eliminate all microarchitectural side channels.
+
+## Current Guarantees
+
+### 1. Restricted File Admission
+
+On Unix platforms, configuration and policy files are loaded through a
+restricted path that:
+
+- opens with `O_NOFOLLOW`
+- rejects symlink inputs
+- requires the final target to be a regular file
+- enforces owner-only permissions (`mode & 0o077 == 0`)
+
+This guarantee applies to both `Config::from_file(...)` and
+`PolicyConfig::from_file(...)`, and therefore also to `ConfigApi::load_file(...)`
+and `PolicyApi::load_file(...)`.
+
+On non-Unix platforms, the crate now fails closed for restricted on-disk
+loading. Hardened file admission is therefore Unix-only in the current design.
+
+### 2. Validation Discipline
+
+Validation covers:
+
+- schema version checks
+- required-field presence
+- path-shape validation
+- range and size constraints
+- custom-condition pre-registration
+- root-tag entropy heuristics
+
+`ValidationMode::Strict` adds environment-dependent filesystem assertions for
+config workflows, including monitored-path existence and logging parent
+directory checks.
+
+### 3. Sensitive Data Handling
+
+The crate uses zeroization and redacted debug behavior for selected sensitive
+types:
+
+- `RootTag`
+- `ProtectedString`
+- `ProtectedPath`
+
+Diff outputs do not expose root-tag secrets directly. Tag changes are surfaced
+through hash prefixes only.
+
+### 4. Runtime Boundedness
+
+`RuntimeConfig` and `RuntimePolicy` use fixed-capacity structures backed by
+`heapless`. After conversion, hot-path runtime operations are designed to avoid
+heap allocation.
+
+The operational diff APIs follow the same principle: API-level config and policy
+diffs return borrowed, fixed-capacity reports instead of owned heap-backed
+change sets.
+
+For the compatibility loaders returning `Config` and `PolicyConfig`, the load,
+deserialize, and validation stages remain allocation-permitted.
+
+For the hardened runtime loaders, the crate uses bounded input admission and
+fixed-capacity admitted types before moving directly into runtime structures.
+
+### 5. Timing Floors
+
+Security-sensitive operations enforce minimum execution floors. The objective is
+to reduce coarse timing discrimination across public paths.
+
+Available controls:
+
+- `DEFAULT_TIMING_FLOOR`
+- `set_timing_floor(...)`
+- `get_timing_floor()`
+- `ConfigApi::with_timing_floor(...)`
+- `PolicyApi::with_timing_floor(...)`
+
+This is a mitigation, not a proof of side-channel resistance.
+
+### 6. Encrypted Log Persistence
+
+When `feature = "log"` is enabled, this crate persists encrypted records by
+delegating to `palisade-errors::AgentError::log(...)`.
+
+That implies:
+
+- the encryption stack is inherited from `palisade-errors`
+- the effective cryptographic backend includes `crypto_bastion 0.4.0` through
+  that dependency
+- this crate does not maintain an independent logging cipher implementation
+
+Errors and selected successful actions can be persisted through this path.
+Enabled encrypted audit writes now fail closed across the operational API
+surface when the persistence step itself cannot complete.
+
+## Operational Requirements
+
+### Required Controls
+
+Operators should treat the following as mandatory in high-risk deployments:
+
+- owner-only file permissions on Unix for config and policy files
+- `ValidationMode::Strict` for production config admission
+- `load_runtime_file(...)` / `load_runtime_str(...)` for production runtime
+  loading
+- runtime conversion during controlled startup, not lazily in hot paths
+- explicit review of log path placement and retention policy
+- regular root-tag rotation procedures
+
+### Strongly Recommended Controls
+
+- external secret distribution through Vault, KMS, or equivalent
+- immutable or tightly controlled configuration directories
+- CI verification of dependency updates
+- environment-specific benchmarking of timing floors
+- incident-response procedures for root-tag rotation and artifact re-derivation
+
+## Known Limitations
+
+### 1. Timing Floors Are Not Side-Channel Proof
+
+Timing floors reduce coarse observable differences but do not eliminate
+microarchitectural leakage, scheduling effects, or pre-error-path work.
+
+### 2. Serialized Root Tags Remain Sensitive at Rest
+
+`RootTag` values serialize as hex so that TOML round-trips remain practical.
+This means the secret exists in plaintext in the config file and must be treated
+as private-key-class material.
+
+### 3. Hardened Restricted Loading Is Unix-Only
+
+The crate does not presently implement a trustworthy Windows ACL or other
+portable restricted-file admission model. In hardened mode it therefore rejects
+on-disk restricted loading on non-Unix targets instead of silently weakening the
+trust boundary.
+
+### 4. Host Compromise Remains Out of Scope
+
+If the host or process is fully compromised, this crate should be considered
+one control among many, not a containment boundary.
+
+## Verification
+
+Recommended verification commands:
+
+```bash
+cargo fmt --all
+cargo test
+cargo test --features log
+cargo check --all-targets --all-features
+cargo audit
+cargo deny check
 ```
-root_tag (256-bit secret)
-    └── host_tag  = SHA3-512(root_tag || hostname)
-            └── artifact_tag = SHA3-512(host_tag || artifact_id)
+
+For deeper assurance, add:
+
+- fuzzing of parse and validation boundaries
+- platform-specific deployment tests
+- operational benchmarking with realistic event rates
+
+Recommended fuzz smoke commands:
+
+```bash
+cargo install cargo-fuzz --locked
+cargo fuzz run config_from_toml -- -max_total_time=20
+cargo fuzz run policy_from_toml -- -max_total_time=20
 ```
 
-- Tags are domain-separated by hostname and artifact ID
-- Rotating the root tag invalidates all derived tags simultaneously
-- `hash_eq_ct` uses constant-time comparison for root tag hash equality
-- No-allocation derivation paths (`*_bytes`, `*_hex_into`) are available for
-  hot-path use
+## Change-Sensitive Areas
 
-### 4) Validation
+Changes to the following files or modules deserve elevated review:
 
-`ValidationMode::Standard` (default via `from_file`):
+- `src/secure_fs.rs`
+- `src/tags.rs`
+- `src/timing.rs`
+- `src/api.rs`
+- any dependency or feature changes involving `palisade-errors`
 
-- Format and type validation
-- Entropy checks on `RootTag` (see below)
-- Range and collection checks
-- No filesystem access beyond reading the config file
+## Disclosure Policy
 
-`ValidationMode::Strict` (via `from_file_with_mode`):
-
-- All Standard checks, plus:
-- Existence checks for `deception.decoy_paths` parent directories
-- Existence checks for `telemetry.watch_paths` entries
-- Existence check and write-access test for `logging.log_path` parent directory
-  (attempts to create and remove a temporary `.palisade-write-test` file)
-
-Root tag entropy checks applied on both `RootTag::new` and `RootTag::generate`:
-
-- All-zero rejection
-- Unique byte threshold (≥ 25% of bytes must be distinct)
-- Sequential pattern detection (> 50% sequential byte runs rejected)
-- Repeated-substring detection (first quarter of bytes must not appear in the rest)
-
-### 5) Runtime no-allocation path
-
-`Config::to_runtime()` and `PolicyConfig::to_runtime()` convert loaded models
-to fixed-capacity runtime forms backed by `heapless`. Runtime operations on
-`RuntimeConfig` and `RuntimePolicy` are designed for zero heap allocation on
-the hot path.
-
-Allocation stages (load, deserialize, validation) remain allocation-permitted
-by design; the no-allocation guarantee applies only to post-conversion runtime
-operations.
-
-### 6) Centralized timing floors
-
-Timing normalization is centralized in `src/timing.rs`. Minimum execution floors
-are applied to all security-sensitive operations via `enforce_operation_min_timing`
-using spin-wait.
-
-Profiles:
-
-- `Balanced` (default): lower latency, moderate smoothing
-- `Hardened`: higher floors, stronger timing smoothing
-
-Operations covered: tag creation, derivation, comparison, config/policy
-load/validate/diff, runtime build, suspicious-process checks, and custom
-condition checks.
-
-### 7) Custom condition registration
-
-Policy `ResponseRule` entries using `ResponseCondition::Custom` must reference
-a name present in `registered_custom_conditions`. Unregistered condition names
-are rejected during policy validation to prevent condition injection via
-externally-supplied policy files.
-
-## Threats addressed
-
-- Basic memory scraping risk reduction via zeroization
-- Config disclosure risk reduction via file permission enforcement
-- Cross-artifact correlation resistance through hierarchical tag derivation
-- Misconfiguration detection via multi-layer validation
-- Coarse timing signal reduction via operation floors
-- Condition injection prevention via custom-condition pre-registration
-
-## Known limitations
-
-### 1) Timing floors are not side-channel proof
-
-Floors reduce coarse timing leakage only. They do not eliminate microarchitectural
-channels (CPU cache, branch predictor, SMT/hyperthreading effects). The spin-wait
-implementation may also be affected by OS scheduling preemption.
-
-### 2) Serialized root tag
-
-`RootTag` serializes as hex to support round-trip TOML load/save. This means
-the root secret is present in plaintext in config files on disk. Serialized
-config files must be treated as high-sensitivity secrets equivalent to private
-key material. See operational recommendations below.
-
-### 3) No-allocation scope is post-conversion only
-
-The no-allocation guarantee applies to `RuntimeConfig` and `RuntimePolicy`
-operations. The load, deserialize, and `to_runtime()` conversion stages
-allocate by design.
-
-### 4) Entropy checks are heuristic
-
-Checks catch common weak patterns (zeros, sequences, repeating blocks) but are
-not a formal randomness proof. Use a CSPRNG (e.g. `openssl rand -hex 32`) for
-tag generation. `RootTag::generate()` uses OS RNG (`OsRng`) and validates even
-generated entropy as a sanity check.
-
-### 5) OS / platform boundary
-
-Filesystem and host-level hardening are external requirements. Root-level
-compromise is out of scope. The crate enforces what it can observe at the
-process boundary.
-
-### 6) Non-Unix permission model
-
-On non-Unix platforms, file permission enforcement is not implemented in-crate.
-NTFS ACL validation must be handled externally.
-
-## Operational recommendations
-
-### File protection
-
-- Config and policy files must be `chmod 600` (enforced on Unix).
-- Do not commit config files containing `root_tag` values to version control.
-- Prefer secret delivery via Vault, KMS, or a secrets manager; write the
-  resolved config to a tempfile with `O_TMPFILE` or equivalent.
-
-### Key hygiene
-
-- Rotate root tags on incident response, agent lifecycle events, and on a
-  regular schedule.
-- After rotation, all previously derived artifact tags are invalidated —
-  re-derive and re-deploy honeytokens.
-- Store root tag backups with the same controls as private key material.
-
-### Runtime mode
-
-- Call `to_runtime()` at startup and operate exclusively on `RuntimeConfig` /
-  `RuntimePolicy` in hot paths.
-- Avoid using allocation-heavy deserialization APIs in latency-sensitive loops.
-
-### Validation mode
-
-- Use `ValidationMode::Strict` in production deployments where the filesystem
-  is known-good.
-- Use `ValidationMode::Standard` in CI/testing environments where monitored
-  paths may not exist.
-- Do not call `validate()` after `from_file()` — validation is already applied
-  internally. Calling it again is redundant.
-
-### Timing profile
-
-- Use `TimingProfile::Hardened` in hostile network environments or where the
-  crate is exposed to untrusted callers.
-- Use `TimingProfile::Balanced` when latency budget is constrained and the
-  threat model permits reduced floor margins.
-
-### Build and dependency hygiene
-
-- Use reproducible CI builds.
-- Run `cargo audit` and supply-chain auditing on dependency updates.
-- Review changes to `timing.rs`, `tags.rs`, and `errors.rs` with extra scrutiny
-  — these are the highest-sensitivity modules.
-
-## Hardening roadmap (planned)
-
-- Optional encrypted-at-rest config integration patterns (Vault/KMS transit)
-- Additional constant-time verification harnesses
-- Expanded static analysis and fuzzing coverage (`cargo-fuzz` targets for
-  entropy validation and TOML parsing paths)
-- Non-Unix permission enforcement via platform ACL APIs
+Please allow time for triage and coordinated remediation before public
+disclosure. Reports that include concrete reproductions and deployment context
+are substantially easier to assess and prioritize.

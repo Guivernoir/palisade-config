@@ -1,13 +1,14 @@
 //! Configuration and policy diffing for change tracking.
 
-use crate::{Config, PolicyConfig};
-use crate::timing::{enforce_operation_min_timing, TimingOperation};
-use std::collections::HashSet;
-use std::path::PathBuf;
+use crate::timing::{TimingOperation, enforce_operation_min_timing};
+use crate::{AgentError, Config, PolicyConfig, Result};
+use core::fmt::Write as _;
+use heapless::{String as HString, Vec as HVec};
+use std::path::Path;
 use std::time::Instant;
 
 /// Validation strictness level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ValidationMode {
     /// Standard validation (format checks, no filesystem access)
     Standard,
@@ -16,139 +17,273 @@ pub enum ValidationMode {
     Strict,
 }
 
-/// Configuration change detected during diff.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigChange {
-    /// Root tag changed (shows hash, not secret)
-    RootTagChanged { old_hash: String, new_hash: String },
+impl Default for ValidationMode {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
 
-    /// Decoy paths changed
-    PathsChanged {
-        added: Vec<PathBuf>,
-        removed: Vec<PathBuf>,
+const CFG_VALIDATION_FAILED: u16 = 101;
+const MAX_CONFIG_DIFF_CHANGES: usize = 32;
+const MAX_POLICY_DIFF_CHANGES: usize = 32;
+const HASH_PREFIX_HEX_LEN: usize = 16;
+
+/// Fixed-capacity configuration diff report.
+pub type ConfigDiff<'a> = HVec<ConfigChange<'a>, MAX_CONFIG_DIFF_CHANGES>;
+
+/// Fixed-capacity policy diff report.
+pub type PolicyDiff<'a> = HVec<PolicyChange<'a>, MAX_POLICY_DIFF_CHANGES>;
+
+/// Configuration change detected during diff.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigChange<'a> {
+    /// Root tag changed (shows hash, not secret)
+    RootTagChanged {
+        /// Prefix hash of the previous root tag.
+        old_hash: HString<HASH_PREFIX_HEX_LEN>,
+        /// Prefix hash of the replacement root tag.
+        new_hash: HString<HASH_PREFIX_HEX_LEN>,
+    },
+
+    /// A decoy path was introduced in the candidate configuration.
+    PathAdded {
+        /// Path newly introduced in the candidate configuration.
+        path: &'a Path,
+    },
+
+    /// A decoy path was removed from the previous configuration.
+    PathRemoved {
+        /// Path removed from the previous configuration.
+        path: &'a Path,
     },
 
     /// Capability settings changed
     CapabilitiesChanged {
-        field: String,
-        old: String,
-        new: String,
+        /// Name of the capability field that changed.
+        field: &'static str,
+        /// Previous serialized value for the field.
+        old: bool,
+        /// New serialized value for the field.
+        new: bool,
     },
 }
 
 /// Policy change detected during diff.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PolicyChange {
+#[derive(Debug, PartialEq)]
+pub enum PolicyChange<'a> {
     /// Threshold value changed
     ThresholdChanged {
-        field: String,
+        /// Name of the threshold field that changed.
+        field: &'static str,
+        /// Previous threshold value.
         old: f64,
+        /// New threshold value.
         new: f64,
     },
 
     /// Response rules changed
     ResponseRulesChanged {
+        /// Number of response rules before the change.
         old_count: usize,
+        /// Number of response rules after the change.
         new_count: usize,
     },
 
-    /// Suspicious process patterns changed
-    SuspiciousProcessesChanged {
-        added: Vec<String>,
-        removed: Vec<String>,
+    /// Suspicious process pattern introduced in the new policy.
+    SuspiciousProcessAdded {
+        /// Pattern introduced in the new policy.
+        pattern: &'a str,
+    },
+
+    /// Suspicious process pattern removed from the previous policy.
+    SuspiciousProcessRemoved {
+        /// Pattern removed from the previous policy.
+        pattern: &'a str,
     },
 }
 
 impl Config {
     /// Diff configuration against another configuration.
-    #[must_use]
-    pub fn diff(&self, other: &Config) -> Vec<ConfigChange> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixed-capacity diff report cannot represent all
+    /// detected changes.
+    pub fn diff<'a>(&'a self, other: &'a Config) -> Result<ConfigDiff<'a>> {
         let started = Instant::now();
-        let mut changes = Vec::new();
+        let result = (|| {
+            let mut changes = ConfigDiff::new();
 
-        // Compare root tags via hash (secure, no exposure)
-        if !self.deception.root_tag.hash_eq_ct(&other.deception.root_tag) {
-            changes.push(ConfigChange::RootTagChanged {
-                old_hash: hex::encode(&self.deception.root_tag.hash()[..8]),
-                new_hash: hex::encode(&other.deception.root_tag.hash()[..8]),
-            });
-        }
+            // Compare root tags via hash (secure, no exposure)
+            if !self
+                .deception
+                .root_tag
+                .hash_eq_ct(&other.deception.root_tag)
+            {
+                push_config_change(
+                    &mut changes,
+                    ConfigChange::RootTagChanged {
+                        old_hash: hash_prefix_hex(&self.deception.root_tag.hash()[..8])?,
+                        new_hash: hash_prefix_hex(&other.deception.root_tag.hash()[..8])?,
+                    },
+                )?;
+            }
 
-        // Compare paths - use references to avoid cloning
-        let old_paths: HashSet<&PathBuf> = self.deception.decoy_paths.iter().collect();
-        let new_paths: HashSet<&PathBuf> = other.deception.decoy_paths.iter().collect();
+            for path in &other.deception.decoy_paths {
+                if !self.deception.decoy_paths.iter().any(|current| current == path) {
+                    push_config_change(
+                        &mut changes,
+                        ConfigChange::PathAdded {
+                            path: path.as_path(),
+                        },
+                    )?;
+                }
+            }
 
-        let added: Vec<PathBuf> = new_paths
-            .difference(&old_paths)
-            .map(|&p| p.clone())  // Only clone when building final diff result
-            .collect();
-        let removed: Vec<PathBuf> = old_paths
-            .difference(&new_paths)
-            .map(|&p| p.clone())  // Only clone when building final diff result
-            .collect();
+            for path in &self.deception.decoy_paths {
+                if !other.deception.decoy_paths.iter().any(|next| next == path) {
+                    push_config_change(
+                        &mut changes,
+                        ConfigChange::PathRemoved {
+                            path: path.as_path(),
+                        },
+                    )?;
+                }
+            }
 
-        if !added.is_empty() || !removed.is_empty() {
-            changes.push(ConfigChange::PathsChanged { added, removed });
-        }
+            if self.telemetry.enable_syscall_monitor != other.telemetry.enable_syscall_monitor {
+                push_config_change(
+                    &mut changes,
+                    ConfigChange::CapabilitiesChanged {
+                        field: "enable_syscall_monitor",
+                        old: self.telemetry.enable_syscall_monitor,
+                        new: other.telemetry.enable_syscall_monitor,
+                    },
+                )?;
+            }
 
-        // Compare syscall monitoring capability
-        if self.telemetry.enable_syscall_monitor != other.telemetry.enable_syscall_monitor {
-            changes.push(ConfigChange::CapabilitiesChanged {
-                field: "enable_syscall_monitor".to_string(),
-                old: self.telemetry.enable_syscall_monitor.to_string(),
-                new: other.telemetry.enable_syscall_monitor.to_string(),
-            });
-        }
+            Ok(changes)
+        })();
 
         enforce_operation_min_timing(started, TimingOperation::ConfigDiff);
-        changes
+        result
     }
 }
 
 impl PolicyConfig {
     /// Diff policy against another policy.
-    #[must_use]
-    pub fn diff(&self, other: &PolicyConfig) -> Vec<PolicyChange> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixed-capacity diff report cannot represent all
+    /// detected changes.
+    pub fn diff<'a>(&'a self, other: &'a PolicyConfig) -> Result<PolicyDiff<'a>> {
         let started = Instant::now();
-        let mut changes = Vec::new();
+        let result = (|| {
+            let mut changes = PolicyDiff::new();
 
-        // Threshold changes
-        if (self.scoring.alert_threshold - other.scoring.alert_threshold).abs() > 0.01 {
-            changes.push(PolicyChange::ThresholdChanged {
-                field: "alert_threshold".to_string(),
-                old: self.scoring.alert_threshold,
-                new: other.scoring.alert_threshold,
-            });
-        }
+            if (self.scoring.alert_threshold - other.scoring.alert_threshold).abs() > 0.01 {
+                push_policy_change(
+                    &mut changes,
+                    PolicyChange::ThresholdChanged {
+                        field: "alert_threshold",
+                        old: self.scoring.alert_threshold,
+                        new: other.scoring.alert_threshold,
+                    },
+                )?;
+            }
 
-        // Response rules
-        if self.response.rules.len() != other.response.rules.len() {
-            changes.push(PolicyChange::ResponseRulesChanged {
-                old_count: self.response.rules.len(),
-                new_count: other.response.rules.len(),
-            });
-        }
+            if self.response.rules.len() != other.response.rules.len() {
+                push_policy_change(
+                    &mut changes,
+                    PolicyChange::ResponseRulesChanged {
+                        old_count: self.response.rules.len(),
+                        new_count: other.response.rules.len(),
+                    },
+                )?;
+            }
 
-        // Suspicious processes - use references to avoid cloning
-        let old: HashSet<&String> = self.deception.suspicious_processes.iter().collect();
-        let new: HashSet<&String> = other.deception.suspicious_processes.iter().collect();
+            for pattern in &other.deception.suspicious_processes {
+                if !self
+                    .deception
+                    .suspicious_processes
+                    .iter()
+                    .any(|current| current == pattern)
+                {
+                    push_policy_change(
+                        &mut changes,
+                        PolicyChange::SuspiciousProcessAdded {
+                            pattern: pattern.as_str(),
+                        },
+                    )?;
+                }
+            }
 
-        let added: Vec<String> = new
-            .difference(&old)
-            .map(|&s| s.clone())  // Only clone when building final diff result
-            .collect();
-        let removed: Vec<String> = old
-            .difference(&new)
-            .map(|&s| s.clone())  // Only clone when building final diff result
-            .collect();
+            for pattern in &self.deception.suspicious_processes {
+                if !other
+                    .deception
+                    .suspicious_processes
+                    .iter()
+                    .any(|next| next == pattern)
+                {
+                    push_policy_change(
+                        &mut changes,
+                        PolicyChange::SuspiciousProcessRemoved {
+                            pattern: pattern.as_str(),
+                        },
+                    )?;
+                }
+            }
 
-        if !added.is_empty() || !removed.is_empty() {
-            changes.push(PolicyChange::SuspiciousProcessesChanged { added, removed });
-        }
+            Ok(changes)
+        })();
 
         enforce_operation_min_timing(started, TimingOperation::PolicyDiff);
-        changes
+        result
     }
+}
+
+fn push_config_change<'a>(
+    changes: &mut ConfigDiff<'a>,
+    change: ConfigChange<'a>,
+) -> Result<()> {
+    changes.push(change).map_err(|_| {
+        AgentError::new(
+            CFG_VALIDATION_FAILED,
+            "Configuration validation failed",
+            "operation=diff_config; fixed-capacity diff buffer exhausted",
+            "config.diff",
+        )
+    })
+}
+
+fn push_policy_change<'a>(
+    changes: &mut PolicyDiff<'a>,
+    change: PolicyChange<'a>,
+) -> Result<()> {
+    changes.push(change).map_err(|_| {
+        AgentError::new(
+            CFG_VALIDATION_FAILED,
+            "Configuration validation failed",
+            "operation=diff_policy; fixed-capacity diff buffer exhausted",
+            "policy.diff",
+        )
+    })
+}
+
+fn hash_prefix_hex(bytes: &[u8]) -> Result<HString<HASH_PREFIX_HEX_LEN>> {
+    let mut out = HString::<HASH_PREFIX_HEX_LEN>::new();
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").map_err(|_| {
+            AgentError::new(
+                CFG_VALIDATION_FAILED,
+                "Configuration validation failed",
+                "operation=diff_config; fixed-capacity root-tag hash buffer exhausted",
+                "config.diff",
+            )
+        })?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -162,7 +297,7 @@ mod tests {
         let mut config2 = Config::default();
         config2.deception.root_tag = RootTag::generate().expect("Failed to generate tag");
 
-        let changes = config1.diff(&config2);
+        let changes = config1.diff(&config2).expect("diff");
         assert!(!changes.is_empty());
 
         if let Some(ConfigChange::RootTagChanged { old_hash, new_hash }) = changes.first() {
@@ -182,11 +317,11 @@ mod tests {
         policy1.scoring.alert_threshold = 50.0;
         policy2.scoring.alert_threshold = 75.0;
 
-        let changes = policy1.diff(&policy2);
+        let changes = policy1.diff(&policy2).expect("diff");
         assert!(!changes.is_empty());
 
         if let Some(PolicyChange::ThresholdChanged { field, old, new }) = changes.first() {
-            assert_eq!(field, "alert_threshold");
+            assert_eq!(*field, "alert_threshold");
             assert_eq!(*old, 50.0);
             assert_eq!(*new, 75.0);
         } else {

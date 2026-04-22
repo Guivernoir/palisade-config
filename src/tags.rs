@@ -1,15 +1,16 @@
 //! Cryptographic tag derivation for honeypot artifacts.
 
-use crate::errors::EntropyValidationError;
-use crate::timing::{enforce_operation_min_timing, TimingOperation};
-use palisade_errors::Result;
+use crate::timing::{TimingOperation, enforce_operation_min_timing};
+use crate::{AgentError, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest, Sha3_512};
 use std::time::Instant;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+const CFG_INVALID_VALUE: u16 = 103;
+
 /// Root cryptographic tag with hierarchical derivation capability.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RootTag {
     /// The root secret (never exposed, never serialized, zeroized on drop)
     secret: [u8; 32],
@@ -28,12 +29,29 @@ impl RootTag {
         let result = (|| {
             // Validation 1: Exact length (256-bit security)
             if hex.len() != 64 {
-                return Err(EntropyValidationError::insufficient_length(hex.len(), 64));
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    format!(
+                        "operation=validate_root_tag; field=root_tag; reason=Root tag too short; actual_value={} characters; expected_range=minimum 64 for 256-bit security",
+                        hex.len()
+                    ),
+                    "root_tag",
+                ));
             }
 
             // Validation 2: Hex encoding (decode into stack buffer, no heap allocation)
             let mut bytes = [0u8; 32];
-            hex::decode_to_slice(hex, &mut bytes).map_err(EntropyValidationError::invalid_hex)?;
+            hex::decode_to_slice(hex, &mut bytes).map_err(|error| {
+                AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    format!(
+                        "operation=validate_root_tag; field=root_tag; Root tag must be valid hex encoding: {error}"
+                    ),
+                    "root_tag",
+                )
+            })?;
 
             // Validation 3: Entropy (CRITICAL - applies to ALL tags)
             Self::validate_entropy(&bytes)?;
@@ -46,7 +64,10 @@ impl RootTag {
             let mut hash = [0u8; 64];
             hash.copy_from_slice(hash_result.as_slice());
 
-            Ok(Self { secret: bytes, hash })
+            Ok(Self {
+                secret: bytes,
+                hash,
+            })
         })();
 
         enforce_operation_min_timing(started, TimingOperation::RootTagNew);
@@ -54,9 +75,9 @@ impl RootTag {
     }
 
     /// Generate cryptographically secure root tag using OS RNG.
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns error if the OS RNG produces invalid entropy (catastrophic system failure).
     pub fn generate() -> Result<Self> {
         let started = Instant::now();
@@ -89,7 +110,12 @@ impl RootTag {
     /// Validate entropy quality with comprehensive heuristic checks.
     fn validate_entropy(bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
-            return Err(EntropyValidationError::insufficient_length(0, 32));
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                "operation=validate_root_tag; field=root_tag; reason=Root tag too short; actual_value=0 characters; expected_range=minimum 32 for 256-bit security",
+                "root_tag",
+            ));
         }
 
         // Allocation-free entropy heuristics:
@@ -119,28 +145,51 @@ impl RootTag {
         }
 
         if all_zeros {
-            return Err(EntropyValidationError::all_zeros());
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                "operation=validate_entropy; field=root_tag; Root tag has insufficient entropy (all zeros)",
+                "root_tag",
+            ));
         }
 
         // Check 2: Byte Diversity (require at least 25% unique bytes)
         if unique_count < bytes.len() / 4 {
-            return Err(EntropyValidationError::low_diversity(
-                unique_count,
-                bytes.len(),
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                format!(
+                    "operation=validate_entropy; field=root_tag; Root tag has low entropy (only {unique_count}/{}) unique bytes",
+                    bytes.len()
+                ),
+                "root_tag",
             ));
         }
 
         // Check 3: Sequential Pattern Detection
         if sequential_count > bytes.len() / 2 {
-            return Err(EntropyValidationError::sequential_pattern());
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                "operation=validate_entropy; field=root_tag; Root tag appears to be sequential pattern",
+                "root_tag",
+            ));
         }
 
         // Check 4: Substring Repetition Detection
         if bytes.len() >= 8 {
             let first_quarter = &bytes[0..bytes.len() / 4];
             let rest = &bytes[bytes.len() / 4..];
-            if rest.windows(first_quarter.len()).any(|w| w == first_quarter) {
-                return Err(EntropyValidationError::repeated_substring());
+            if rest
+                .windows(first_quarter.len())
+                .any(|w| w == first_quarter)
+            {
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    "operation=validate_entropy; field=root_tag; Root tag contains repeated substrings",
+                    "root_tag",
+                ));
             }
         }
 
@@ -162,25 +211,13 @@ impl RootTag {
         out
     }
 
-    /// Derive host-specific tag using SHA3-512.
-    #[must_use]
-    pub fn derive_host_tag(&self, hostname: &str) -> Vec<u8> {
-        self.derive_host_tag_bytes(hostname).to_vec()
-    }
-
     /// Derive artifact-specific tag bytes using SHA3-512 (no heap allocation).
     #[must_use]
     pub fn derive_artifact_tag_bytes(&self, hostname: &str, artifact_id: &str) -> [u8; 64] {
         let started = Instant::now();
         let host_tag = self.derive_host_tag_bytes(hostname);
 
-        let mut hasher = Sha3_512::new();
-        hasher.update(host_tag);
-        hasher.update(artifact_id.as_bytes());
-
-        let digest = hasher.finalize();
-        let mut out = [0u8; 64];
-        out.copy_from_slice(&digest);
+        let out = Self::derive_artifact_tag_from_host_tag_bytes(&host_tag, artifact_id);
         enforce_operation_min_timing(started, TimingOperation::RootTagDeriveArtifact);
         out
     }
@@ -194,18 +231,34 @@ impl RootTag {
         artifact_id: &str,
         out: &mut [u8; 128],
     ) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
         let digest = self.derive_artifact_tag_bytes(hostname, artifact_id);
-        for (i, &b) in digest.iter().enumerate() {
-            out[i * 2] = HEX[(b >> 4) as usize];
-            out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
-        }
+        Self::encode_hex_into(&digest, out);
     }
 
-    /// Derive artifact-specific tag using SHA3-512.
+    /// Derive artifact-specific tag bytes from a pre-derived host tag.
     #[must_use]
-    pub fn derive_artifact_tag(&self, hostname: &str, artifact_id: &str) -> String {
-        hex::encode(self.derive_artifact_tag_bytes(hostname, artifact_id))
+    pub fn derive_artifact_tag_from_host_tag_bytes(
+        host_tag: &[u8; 64],
+        artifact_id: &str,
+    ) -> [u8; 64] {
+        let mut hasher = Sha3_512::new();
+        hasher.update(host_tag);
+        hasher.update(artifact_id.as_bytes());
+
+        let digest = hasher.finalize();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    /// Derive artifact-specific lowercase hex bytes from a pre-derived host tag.
+    pub fn derive_artifact_tag_hex_from_host_tag_into(
+        host_tag: &[u8; 64],
+        artifact_id: &str,
+        out: &mut [u8; 128],
+    ) {
+        let digest = Self::derive_artifact_tag_from_host_tag_bytes(host_tag, artifact_id);
+        Self::encode_hex_into(&digest, out);
     }
 
     /// Get SHA3-512 hash for comparison without exposing secret.
@@ -221,6 +274,14 @@ impl RootTag {
         let eq = ct_eq(self.hash(), other.hash());
         enforce_operation_min_timing(started, TimingOperation::RootTagHashCompare);
         eq
+    }
+
+    fn encode_hex_into(digest: &[u8; 64], out: &mut [u8; 128]) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for (i, &b) in digest.iter().enumerate() {
+            out[i * 2] = HEX[(b >> 4) as usize];
+            out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+        }
     }
 }
 
@@ -293,16 +354,16 @@ mod tests {
     #[test]
     fn test_tag_derivation_is_deterministic() {
         let root = RootTag::generate().expect("Failed to generate root");
-        let tag1 = root.derive_artifact_tag("host1", "artifact1");
-        let tag2 = root.derive_artifact_tag("host1", "artifact1");
+        let tag1 = root.derive_artifact_tag_bytes("host1", "artifact1");
+        let tag2 = root.derive_artifact_tag_bytes("host1", "artifact1");
         assert_eq!(tag1, tag2);
     }
 
     #[test]
     fn test_tag_derivation_different_hosts() {
         let root = RootTag::generate().expect("Failed to generate root");
-        let tag1 = root.derive_artifact_tag("host1", "artifact1");
-        let tag2 = root.derive_artifact_tag("host2", "artifact1");
+        let tag1 = root.derive_artifact_tag_bytes("host1", "artifact1");
+        let tag2 = root.derive_artifact_tag_bytes("host2", "artifact1");
         assert_ne!(tag1, tag2);
     }
 

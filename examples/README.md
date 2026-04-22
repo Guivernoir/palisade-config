@@ -1,207 +1,187 @@
-# palisade-config — Examples
+# Examples Guide
 
-Comprehensive runnable examples covering every surface of the `palisade-config` crate.
+## Abstract
 
-## Prerequisites
+The examples in this repository are intended to demonstrate operational usage of
+`palisade-config`, not merely API syntax. Each example emphasizes a particular
+deployment concern: admission-time validation, runtime conversion, diff-based
+reload review, timing-floor selection, or encrypted audit persistence.
+
+The examples should be read as executable notes for implementers evaluating the
+crate in a realistic security context.
+
+## Execution Prerequisites
 
 ```toml
-# Cargo.toml
 [dev-dependencies]
-palisade-config = "1.0.1"
+palisade-config = "2.0.0"
 tokio = { version = "1", features = ["full"] }
 hex = "0.4"
 serde_json = "1"
 ```
 
-## Running Examples
+For examples that read on-disk configuration, ensure the sample files are
+present and, on Unix, restricted appropriately:
+
+```bash
+chmod 600 examples/config.toml
+chmod 600 examples/policy.toml
+```
+
+## Running the Suite
 
 ```bash
 cargo run --example basics
 cargo run --example toml_loading
-cargo run --example runtime_hot_path
-cargo run --example 04_tag_derivation
-cargo run --example 05_diffing
-cargo run --example 06_advanced_policy
-cargo run --example 07_timing_profiles
-cargo run --example 08_full_integration
+cargo run --example hot_paths
+cargo run --example derivation
+cargo run --example diffing
+cargo run --example advanced_policy
+cargo run --example timing
+cargo run --example full
 ```
 
-To activate Hardened timing mode in examples 07 and 08:
+To exercise encrypted audit persistence:
 
 ```bash
-PALISADE_ENV=production cargo run --example 07_timing_profiles
-PALISADE_ENV=production cargo run --example 08_full_integration
+cargo run --example toml_loading --features log
 ```
 
----
+## Example Matrix
 
-## Example Overview
+### `basic_defaults.rs`
 
-### `01_basic_defaults.rs` — Defaults & Validation
+Purpose:
+Inspect the default config and policy models, validate them, and understand the
+baseline shape of the crate without touching the filesystem.
 
-The starting point. Creates `Config` and `PolicyConfig` from defaults, inspects
-every field, runs standard validation, and demonstrates what a validation failure
-looks like. No filesystem access required.
+Covers:
+`Config::default`, `PolicyConfig::default`, `Config::validate`,
+`PolicyConfig::validate`, `Severity::from_score`, protected debug redaction.
 
-**Covers:** `Config::default`, `PolicyConfig::default`, `Config::validate`,
-`PolicyConfig::validate`, `Severity::from_score`, `ProtectedString`/`ProtectedPath`
-debug redaction.
+### `toml_loading.rs`
 
----
+Purpose:
+Demonstrate the intended operational entry points: `ConfigApi` and `PolicyApi`.
 
-### `02_toml_loading.rs` — Loading from TOML
+Covers:
+embedded validation, strict config validation, error-surface handling,
+suspicious-process checks through `PolicyApi`.
 
-Loads `config.toml` and `policy.toml` from disk using both `Standard` and `Strict`
-validation modes. Demonstrates the error-handling contract: public error vs.
-internal log, and what to show to end-users vs. what to keep internal.
+For high-risk runtime startup, prefer the hardened runtime-loading methods over
+the compatibility loaders:
 
-**Covers:** `Config::from_file`, `Config::from_file_with_mode`, `PolicyConfig::from_file`,
-`ValidationMode::Standard`, `ValidationMode::Strict`, `AgentError` public/internal split.
+- `ConfigApi::load_runtime_file(...)`
+- `PolicyApi::load_runtime_file(...)`
 
-**Requires:** `examples/config.toml` and `examples/policy.toml` to be present.
+### `runtime_hot_paths.rs`
 
----
+Purpose:
+Show the transition from admission-time structures to fixed-capacity runtime
+structures and highlight the post-conversion no-allocation operating model.
 
-### `03_runtime_hotpath.rs` — No-Allocation Hot Path
+Covers:
+`to_runtime`, artifact-tag derivation into caller buffers, suspicious-process
+checks, registered custom-condition lookups.
 
-The most performance-critical example. Shows the one-time conversion from
-heap-allocated config/policy into stack-only `RuntimeConfig`/`RuntimePolicy`,
-then drives a simulated 10,000-event loop with zero heap allocation per iteration.
+### `tag_derivation.rs`
 
-**Covers:** `Config::to_runtime`, `PolicyConfig::to_runtime`, `RuntimeConfig`,
-`RuntimePolicy`, `derive_artifact_tag_hex_into`, `is_suspicious_process`,
-`is_registered_custom_condition`, capacity overflow handling.
+Purpose:
+Explain the `RootTag` hierarchy and demonstrate deterministic derivation,
+entropy rejection, and no-allocation hex output.
 
----
+Covers:
+`RootTag::generate`, `RootTag::new`, host/artifact derivation, constant-time
+comparison, serde round-trip constraints.
 
-### `04_tag_derivation.rs` — Cryptographic Tags
+### `diffing.rs`
 
-Deep-dive into the `RootTag` hierarchy. Covers generation, hex parsing, entropy
-validation (all 4 rejection cases), the two-level derivation chain
-(`root → host_tag → artifact_tag`), no-alloc hex output, constant-time comparison,
-and serialise/deserialise round-trips including the `***REDACTED***` sentinel rejection.
+Purpose:
+Illustrate config/policy change review for hot reload and partial rollout.
 
-**Covers:** `RootTag::generate`, `RootTag::new`, `RootTag::derive_host_tag`,
-`RootTag::derive_artifact_tag`, `RootTag::derive_artifact_tag_hex_into`,
-`RootTag::hash_eq_ct`, entropy validation errors, serde round-trip.
+Covers:
+borrowed fixed-capacity diff reports, secret-preserving diffs, hot-reload
+gating.
 
----
+### `advanced_policy.rs`
 
-### `05_diffing.rs` — Change Tracking
+Purpose:
+Model realistic response logic with explicit condition semantics and
+pre-registered custom-condition discipline.
 
-Shows all diff variants: decoy path additions/removals, syscall monitor toggle,
-root tag rotation, scoring threshold changes, response rule count changes, and
-suspicious process list updates. Concludes with a practical hot-reload gate pattern.
+Covers:
+response conditions, action types, severity mapping, custom-condition policy.
 
-**Covers:** `Config::diff`, `PolicyConfig::diff`, `ConfigChange`, `PolicyChange`,
-hot-reload safety decision logic.
+### `timing_profile.rs`
 
----
+Purpose:
+Measure the timing-floor controls and explain how they interact with the
+security-sensitive public surface.
 
-### `06_advanced_policy.rs` — Advanced Policy Configuration
+Covers:
+`DEFAULT_TIMING_FLOOR`, `set_timing_floor`, `get_timing_floor`,
+`ConfigApi::with_timing_floor`, `PolicyApi::with_timing_floor`.
 
-Builds a production-grade financial-sector policy from scratch. Demonstrates all
-five `ResponseCondition` variants with realistic parameters, custom condition
-pre-registration security, duplicate severity rejection, and dry-run mode rollout.
+### `full_integration.rs`
 
-**Covers:** `ScoringWeights`, `ResponseCondition` (all variants), `ResponseRule`,
-`ActionType`, `PolicyConfig::validate`, custom condition injection prevention,
-dry-run mode, severity reference table.
+Purpose:
+Present a realistic startup-to-runtime lifecycle for a honeypot or deception
+agent using the crate end to end.
 
----
+Covers:
+timing-floor selection, file admission, runtime conversion, artifact-tag
+binding, event scoring, diff-based reload review, shutdown posture.
 
-### `07_timing_profiles.rs` — Timing Side-Channel Mitigations
+## Logging Note
 
-Benchmarks key operations under both `Balanced` and `Hardened` profiles and prints
-a comparison table. Explains *why* timing floors exist and how the spin-wait
-mechanism works on both fast and slow hardware. Includes a recommended profile
-selection pattern based on `PALISADE_ENV`.
+When `feature = "log"` is enabled, example logging is not plain text. Audit
+persistence is routed through `palisade-errors::AgentError::log(...)`, which
+means the encrypted persistence path is inherited from that crate.
 
-**Covers:** `set_timing_profile`, `get_timing_profile`, `TimingProfile`, timing
-floor semantics, thread-safety of atomic profile reads.
+Operationally:
 
----
+- `with_log_path(...)` enables the encrypted sink
+- `log_errors(true)` persists error outcomes
+- `log_loads(true)`, `log_validations(true)`, `log_runtime_builds(true)`,
+  `log_diffs(true)`, and `log_checks(true)` opt into successful action records
+- log paths should be absolute
+- enabled encrypted persistence fails closed if the audit write cannot be
+  completed
 
-### `08_full_integration.rs` — Daemon Startup Pattern
+## High-Assurance Evaluation
 
-The authoritative end-to-end reference. Walks through all 7 lifecycle phases:
-timing profile selection → config/policy load → runtime conversion →
-artifact tag binding → event processing loop → hot-reload with diff-gating →
-graceful shutdown with zeroization.
+For a production-style evaluation of the crate rather than just the examples,
+run:
 
-**Covers:** everything, in the order a real agent binary would use it.
-
----
-
-## TOML Templates
-
-### `config.toml`
-
-Fully annotated configuration template. Every field documented with:
-- Type and accepted values
-- Default value
-- Security implications
-- When to change it
-
-**Security note:** `root_tag` is a real-looking but intentionally invalid hex
-string. Replace it with output from `RootTag::generate()` before use.
-
-### `policy.toml`
-
-Fully annotated policy template covering:
-- All 5 `ResponseCondition` types with syntax examples
-- All `ActionType` variants
-- Comprehensive `suspicious_processes` list (14 common attacker tools)
-- File pattern matching list
-- Custom condition whitelist with commented examples
-
----
-
-## Security Notes
-
-### root_tag in config.toml
-
-The `root_tag` field in `config.toml` is the master secret for your entire
-artifact tag hierarchy. Treat it like a private key:
-
-```
-chmod 600 /etc/palisade/config.toml
-chown palisade:palisade /etc/palisade/config.toml
+```bash
+cargo test
+cargo test --features log
+cargo check --all-targets --all-features
+cargo audit
+cargo deny check
 ```
 
-Generate a new one per environment:
+## Reading Order
 
-```rust
-use palisade_config::RootTag;
-let tag = RootTag::generate()?;
-// Prints: a3f8c2...  (64 hex chars)
-println!("{}", serde_json::to_string(&tag)?);
-```
+For first-time evaluation, the most useful progression is:
 
-### ProtectedString / ProtectedPath
+1. `basic_defaults.rs`
+2. `toml_loading.rs`
+3. `runtime_hot_paths.rs`
+4. `timing_profile.rs`
+5. `full_integration.rs`
 
-Fields wrapped in these types are automatically zeroized when dropped and
-redact themselves in `Debug` output. Never unwrap them into plain `String`/`PathBuf`
-and pass to logging — use the `.as_str()` / `.as_path()` accessors only where
-needed, and let the wrappers go out of scope naturally.
+This order moves from model shape to admission path, then from runtime
+operational behavior to end-to-end deployment framing.
 
-### ValidationMode::Strict
+## Limitations
 
-Use `Strict` on daemon startup (paths must exist, log dir must be writable).
-Use `Standard` for config validation in CI/testing environments where the
-target paths don't exist.
+The examples are pedagogical rather than exhaustive. They do not replace:
 
-### Error Handling Contract
+- environment-specific benchmarking
+- platform hardening
+- secrets-distribution design
+- formal incident-response playbooks
 
-```rust
-match Config::from_file(path).await {
-    Ok(config) => { /* proceed */ }
-    Err(e) => {
-        // SAFE to return to caller / log externally:
-        return Err(e.to_string());
-
-        // UNSAFE — contains internal paths, operation names, metadata:
-        // log::error!("{:?}", e.internal_log());  // keep internal only
-    }
-}
-```
+For the crate's current guarantees and limits, consult the repository-level
+security policy.

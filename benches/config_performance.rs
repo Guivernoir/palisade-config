@@ -1,13 +1,13 @@
 // benches/palisade_performance.rs
 //! Comprehensive benchmarks for palisade-config performance characteristics
-//! 
+//!
 //! Validates performance of key components including config loading, validation,
 //! policy operations, tag derivation, and more.
 //! Results are automatically saved to: palisade_benchmark_results.txt
 
-use criterion::{criterion_group, criterion_main, Bencher, Criterion};
+use criterion::{Bencher, Criterion, criterion_group, criterion_main};
 use palisade_config::*;
-use palisade_errors::{definitions, AgentError};
+use palisade_errors::AgentError;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use std::time::Duration;
 // Precise Allocation Tracking with stats_alloc
 // ============================================================================
 
-use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use std::alloc::System;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -52,10 +52,12 @@ impl MemStats {
 
     fn from_region(start: &stats_alloc::Stats, end: &stats_alloc::Stats) -> Self {
         let allocated = end.bytes_allocated.saturating_sub(start.bytes_allocated);
-        let deallocated = end.bytes_deallocated.saturating_sub(start.bytes_deallocated);
+        let deallocated = end
+            .bytes_deallocated
+            .saturating_sub(start.bytes_deallocated);
         let alloc_count = end.allocations.saturating_sub(start.allocations);
         let dealloc_count = end.deallocations.saturating_sub(start.deallocations);
-        
+
         Self {
             allocated,
             deallocated,
@@ -104,45 +106,52 @@ impl MemStats {
              └────────────────────────────────────────────────────────",
             label,
             time_ns,
-            self.allocated, 
+            self.allocated,
             self.alloc_count,
-            self.deallocated, 
+            self.deallocated,
             self.dealloc_count,
             self.net.abs(),
-            if self.alloc_count > 0 { self.allocated / self.alloc_count } else { 0 }
+            if self.alloc_count > 0 {
+                self.allocated / self.alloc_count
+            } else {
+                0
+            }
         );
-        
+
         println!("{}", output);
-        
+
         // Write to file with timing data
         Self::append_to_file(label, self, Some(time_ns));
     }
 
     fn append_to_file(label: &str, stats: &MemStats, time_ns: Option<f64>) {
         let filename = "palisade_benchmark_results.txt";
-        
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(filename)
             .expect("Failed to open benchmark results file");
-        
+
         // Write header with timestamp if file is empty/new
-        let is_new_file = file.metadata()
-            .map(|m| m.len() == 0)
-            .unwrap_or(true);
-            
+        let is_new_file = file.metadata().map(|m| m.len() == 0).unwrap_or(true);
+
         if is_new_file {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            
+
             writeln!(file, "════════════════════════════════════════════════════════════════════════════════════════════════").ok();
-            writeln!(file, "Palisade Config Benchmark Results (Memory + Timing) - Unix timestamp: {}", now).ok();
+            writeln!(
+                file,
+                "Palisade Config Benchmark Results (Memory + Timing) - Unix timestamp: {}",
+                now
+            )
+            .ok();
             writeln!(file, "════════════════════════════════════════════════════════════════════════════════════════════════\n").ok();
         }
-        
+
         // Format timing data
         let timing_str = if let Some(ns) = time_ns {
             if ns < 1_000.0 {
@@ -157,8 +166,8 @@ impl MemStats {
         } else {
             "  N/A      ".to_string()
         };
-        
-        writeln!(file, 
+
+        writeln!(file,
             "{:<50} │ Time: {} │ Alloc: {:>8} B ({:>3} calls) │ Dealloc: {:>8} B ({:>3} calls) │ Net: {:>8} B",
             label,
             timing_str,
@@ -251,7 +260,7 @@ fn bench_config_diff(c: &mut Criterion) {
 
     c.bench_function("config_diff", |b| {
         bench_with_mem(b, "Config Diff", || {
-            black_box(config1.diff(&config2));
+            let _ = black_box(config1.diff(&config2));
         })
     });
 }
@@ -305,7 +314,7 @@ fn bench_policy_diff(c: &mut Criterion) {
 
     c.bench_function("policy_diff", |b| {
         bench_with_mem(b, "Policy Diff", || {
-            black_box(policy1.diff(&policy2));
+            let _ = black_box(policy1.diff(&policy2));
         })
     });
 }
@@ -443,28 +452,32 @@ fn bench_runtime_no_alloc(c: &mut Criterion) {
 }
 
 // ============================================================================
-// ERROR BENCHMARKS 
+// ERROR BENCHMARKS
 // ============================================================================
 
 fn bench_error_creation(c: &mut Criterion) {
     c.bench_function("error_creation_simple", |b| {
         bench_with_mem(b, "Error Creation Simple", || {
-            let _ = black_box(AgentError::config(
-                definitions::CFG_PARSE_FAILED,
-                "operation",
-                "details",
+            let _ = black_box(AgentError::new(
+                100,
+                "Configuration input could not be parsed",
+                "operation=bench_error_creation; details=parse failed",
+                "",
             ));
         })
     });
 }
 
-fn bench_error_with_metadata(c: &mut Criterion) {
-    c.bench_function("error_with_metadata", |b| {
-        bench_with_mem(b, "Error With Metadata", || {
+fn bench_error_with_context(c: &mut Criterion) {
+    c.bench_function("error_with_context", |b| {
+        bench_with_mem(b, "Error With Context", || {
             let _ = black_box(
-                AgentError::config(definitions::CFG_PARSE_FAILED, "op", "details")
-                    .with_metadata("key1", "value1")
-                    .with_metadata("key2", "value2"),
+                AgentError::new(
+                    100,
+                    "Configuration input could not be parsed",
+                    "operation=bench_error_with_context; details=parse failed; key1=value1; key2=value2",
+                    "/tmp/palisade-config-bench.toml",
+                ),
             );
         })
     });
@@ -506,7 +519,8 @@ fn bench_config_from_file(c: &mut Criterion) {
 
     c.bench_function("config_from_file", |b| {
         bench_with_mem(b, "Config From File", || {
-            rt.block_on(Config::from_file_with_mode(&path, ValidationMode::Standard)).unwrap();
+            rt.block_on(Config::from_file_with_mode(&path, &ValidationMode::Standard))
+                .unwrap();
         })
     });
 }
@@ -550,7 +564,7 @@ criterion_group!(
 criterion_group!(
     error_benches,
     bench_error_creation,
-    bench_error_with_metadata,
+    bench_error_with_context,
 );
 
 criterion_group!(

@@ -6,10 +6,7 @@
 //!   - Hot-reload validation ("is this change safe to apply live?")
 //!   - Rollback detection ("did someone modify the config on disk?")
 
-use palisade_config::{
-    Config, PolicyConfig, RootTag,
-    ConfigChange, PolicyChange,
-};
+use palisade_config::{Config, ConfigChange, PolicyChange, PolicyConfig, RootTag};
 use std::path::PathBuf;
 
 fn main() {
@@ -23,7 +20,7 @@ fn main() {
     // NOTE: Both have independently generated RootTags, so the root_tag will
     // always differ. In real usage you'd reload from the same file.
     // For this demo we'll focus on the other change types.
-    let all_changes = config_v1.diff(&config_v2);
+    let all_changes = config_v1.diff(&config_v2).expect("config diff");
     println!("  changes detected: {}", all_changes.len());
     for change in &all_changes {
         println!("  - {:?}", change);
@@ -38,28 +35,31 @@ fn main() {
 
     // Simulate a config reload that adds a path and removes another
     config_v2.deception.decoy_paths = vec![
-        PathBuf::from("/tmp/.credentials"),   // kept
-        PathBuf::from("/srv/.honeypot"),       // NEW
-        // "/opt/.backup" — REMOVED
+        PathBuf::from("/tmp/.credentials"), // kept
+        PathBuf::from("/srv/.honeypot"),    // NEW
+                                            // "/opt/.backup" — REMOVED
     ]
     .into_boxed_slice();
 
     // Force same root_tag so we isolate the path diff
     // (in production, root tags come from file — if unchanged the hash matches)
-    config_v2.deception.decoy_paths = config_v1.deception.decoy_paths
+    config_v2.deception.decoy_paths = config_v1
+        .deception
+        .decoy_paths
         .iter()
         .cloned()
         .chain(std::iter::once(PathBuf::from("/srv/.honeypot-new")))
         .collect::<Vec<_>>()
         .into_boxed_slice();
 
-    let changes = config_v1.diff(&config_v2);
+    let changes = config_v1.diff(&config_v2).expect("config diff");
     for change in &changes {
         match change {
-            ConfigChange::PathsChanged { added, removed } => {
-                println!("  PathsChanged:");
-                for p in added   { println!("    + {:?}", p); }
-                for p in removed { println!("    - {:?}", p); }
+            ConfigChange::PathAdded { path } => {
+                println!("  PathAdded: {:?}", path);
+            }
+            ConfigChange::PathRemoved { path } => {
+                println!("  PathRemoved: {:?}", path);
             }
             ConfigChange::RootTagChanged { old_hash, new_hash } => {
                 println!("  RootTagChanged: {}...  →  {}...", old_hash, new_hash);
@@ -78,14 +78,14 @@ fn main() {
     let mut config_v2 = Config::default();
     config_v2.telemetry.enable_syscall_monitor = true;
 
-    let changes = config_v1.diff(&config_v2);
+    let changes = config_v1.diff(&config_v2).expect("config diff");
     for change in &changes {
         if let ConfigChange::CapabilitiesChanged { field, old, new } = change {
             println!("  {field}: {old} → {new}");
         }
     }
     let has_cap_change = changes.iter().any(|c| {
-        matches!(c, ConfigChange::CapabilitiesChanged { field, .. } if field == "enable_syscall_monitor")
+        matches!(c, ConfigChange::CapabilitiesChanged { field, .. } if *field == "enable_syscall_monitor")
     });
     assert!(has_cap_change, "Syscall monitor change must be detected");
     println!("  [OK] Capability change detected.");
@@ -98,10 +98,10 @@ fn main() {
     let mut config_v2 = Config::default();
     config_v2.deception.root_tag = RootTag::generate().expect("generate");
 
-    let changes = config_v1.diff(&config_v2);
+    let changes = config_v1.diff(&config_v2).expect("config diff");
     let tag_change = changes.iter().find_map(|c| {
         if let ConfigChange::RootTagChanged { old_hash, new_hash } = c {
-            Some((old_hash.clone(), new_hash.clone()))
+            Some((old_hash.as_str(), new_hash.as_str()))
         } else {
             None
         }
@@ -115,7 +115,9 @@ fn main() {
         assert_ne!(old, new);
         println!("  [OK] Root tag rotation detected with minimal exposure.");
     } else {
-        println!("  [NOTE] Same root tag in both (both generated same entropy — astronomically unlikely)");
+        println!(
+            "  [NOTE] Same root tag in both (both generated same entropy — astronomically unlikely)"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -127,12 +129,15 @@ fn main() {
     policy_v1.scoring.alert_threshold = 50.0;
     policy_v2.scoring.alert_threshold = 70.0; // tightened
 
-    let changes = policy_v1.diff(&policy_v2);
+    let changes = policy_v1.diff(&policy_v2).expect("policy diff");
     for change in &changes {
         if let PolicyChange::ThresholdChanged { field, old, new } = change {
             println!("  {field}: {old:.1} → {new:.1}");
-            let direction = if new > old { "tightened (higher bar for alerts)" }
-                            else         { "relaxed (lower bar for alerts)" };
+            let direction = if new > old {
+                "tightened (higher bar for alerts)"
+            } else {
+                "relaxed (lower bar for alerts)"
+            };
             println!("  interpretation: threshold {direction}");
         }
     }
@@ -145,9 +150,13 @@ fn main() {
     let mut policy_v2 = PolicyConfig::default();
     policy_v2.response.rules.pop(); // remove Critical rule
 
-    let changes = policy_v1.diff(&policy_v2);
+    let changes = policy_v1.diff(&policy_v2).expect("policy diff");
     for change in &changes {
-        if let PolicyChange::ResponseRulesChanged { old_count, new_count } = change {
+        if let PolicyChange::ResponseRulesChanged {
+            old_count,
+            new_count,
+        } = change
+        {
             println!("  response rules: {old_count} → {new_count}");
             if new_count < old_count {
                 println!("  WARNING: Response coverage reduced — verify intentional");
@@ -170,11 +179,16 @@ fn main() {
     ]
     .into_boxed_slice();
 
-    let changes = policy_v1.diff(&policy_v2);
+    let changes = policy_v1.diff(&policy_v2).expect("policy diff");
     for change in &changes {
-        if let PolicyChange::SuspiciousProcessesChanged { added, removed } = change {
-            println!("  Added   : {:?}", added);
-            println!("  Removed : {:?}", removed);
+        match change {
+            PolicyChange::SuspiciousProcessAdded { pattern } => {
+                println!("  Added   : {:?}", pattern);
+            }
+            PolicyChange::SuspiciousProcessRemoved { pattern } => {
+                println!("  Removed : {:?}", pattern);
+            }
+            _ => {}
         }
     }
 
@@ -183,16 +197,19 @@ fn main() {
     // -------------------------------------------------------------------------
     println!("\n=== Hot-Reload Pattern ===");
     let running_policy = PolicyConfig::default();
-    let new_policy     = PolicyConfig::default(); // in prod: loaded from disk
+    let new_policy = PolicyConfig::default(); // in prod: loaded from disk
 
-    let changes = running_policy.diff(&new_policy);
+    let changes = running_policy.diff(&new_policy).expect("policy diff");
 
-    let safe_to_apply = changes.iter().all(|c| {
-        !matches!(c, PolicyChange::ResponseRulesChanged { new_count, .. } if *new_count == 0)
-    });
+    let safe_to_apply = changes.iter().all(
+        |c| !matches!(c, PolicyChange::ResponseRulesChanged { new_count, .. } if *new_count == 0),
+    );
 
     if safe_to_apply {
-        println!("  Hot-reload: SAFE ({} changes, no critical degradation)", changes.len());
+        println!(
+            "  Hot-reload: SAFE ({} changes, no critical degradation)",
+            changes.len()
+        );
     } else {
         println!("  Hot-reload: BLOCKED — would remove all response rules");
     }

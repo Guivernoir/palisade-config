@@ -1,26 +1,32 @@
 //! # Example 02 — Loading Config & Policy from TOML Files
 //!
-//! Demonstrates loading configuration from disk with both Standard and Strict
-//! validation modes, plus robust error handling patterns.
+//! Demonstrates the public operational APIs with embedded validation, strict
+//! config validation, and robust error handling patterns.
 
-use palisade_config::{Config, PolicyConfig, ValidationMode};
+use palisade_config::{ConfigApi, PolicyApi, ValidationMode};
 
 const CONFIG_PATH: &str = "examples/config.toml";
 const POLICY_PATH: &str = "examples/policy.toml";
 
 #[tokio::main]
 async fn main() {
+    let config_api = ConfigApi::new();
+    let strict_config_api = ConfigApi::new().with_validation_mode(ValidationMode::Strict);
+    let policy_api = PolicyApi::new();
+
     // -------------------------------------------------------------------------
-    // 1. Standard load (most common — validates fields but not filesystem paths)
+    // 1. Standard config load (embedded validation, no extra filesystem checks)
     // -------------------------------------------------------------------------
     println!("--- Loading config (Standard mode) ---");
-    match Config::from_file(CONFIG_PATH).await {
+    match config_api.load_file(CONFIG_PATH).await {
         Ok(config) => {
             println!("[OK] Config loaded successfully.");
             println!("     hostname  : {}", config.hostname());
             println!("     env       : {:?}", config.agent.environment);
             println!("     decoy cnt : {}", config.deception.decoy_paths.len());
-            config.validate().expect("Loaded config must be valid");
+            config_api
+                .validate(&config)
+                .expect("Loaded config must be valid");
             println!("     validation: passed");
         }
         Err(e) => {
@@ -37,7 +43,7 @@ async fn main() {
     //    that the log directory is writable. Use this on daemon startup.
     // -------------------------------------------------------------------------
     println!("\n--- Loading config (Strict mode) ---");
-    match Config::from_file_with_mode(CONFIG_PATH, ValidationMode::Strict).await {
+    match strict_config_api.load_file(CONFIG_PATH).await {
         Ok(_) => println!("[OK] Strict validation passed — all paths exist and are writable."),
         Err(e) => {
             // Expected in CI / sandboxed envs where paths don't exist.
@@ -49,22 +55,43 @@ async fn main() {
     // 3. Load a policy file
     // -------------------------------------------------------------------------
     println!("\n--- Loading policy ---");
-    match PolicyConfig::from_file(POLICY_PATH).await {
+    match policy_api.load_file(POLICY_PATH).await {
         Ok(policy) => {
             println!("[OK] Policy loaded successfully.");
-            println!("     alert_threshold   : {}", policy.scoring.alert_threshold);
+            println!(
+                "     alert_threshold   : {}",
+                policy.scoring.alert_threshold
+            );
             println!("     response rules    : {}", policy.response.rules.len());
-            println!("     suspicious procs  : {}", policy.deception.suspicious_processes.len());
-            println!("     custom conditions : {}", policy.registered_custom_conditions.len());
+            println!(
+                "     suspicious procs  : {}",
+                policy.deception.suspicious_processes.len()
+            );
+            println!(
+                "     custom conditions : {}",
+                policy.registered_custom_conditions.len()
+            );
 
-            policy.validate().expect("Loaded policy must be valid");
+            policy_api
+                .validate(&policy)
+                .expect("Loaded policy must be valid");
             println!("     validation: passed");
 
             // Quick suspicious-process check after loading
-            let test_names = ["MIMIKATZ.exe", "procdump64.exe", "svchost.exe", "LaZagne.py"];
+            let test_names = [
+                "MIMIKATZ.exe",
+                "procdump64.exe",
+                "svchost.exe",
+                "LaZagne.py",
+            ];
             println!("\n     Suspicious-process checks:");
             for name in test_names {
-                println!("       {name:20} -> {}", policy.is_suspicious_process(name));
+                println!(
+                    "       {name:20} -> {}",
+                    policy_api
+                        .is_suspicious_process(&policy, name)
+                        .expect("policy check")
+                );
             }
         }
         Err(e) => {
@@ -77,18 +104,15 @@ async fn main() {
     // -------------------------------------------------------------------------
     // 4. Error-handling patterns
     //
-    // AgentError exposes a public display for users and an internal_log() for
-    // your logging pipeline. Never forward internal_log to end-users.
+    // AgentError exposes only a sanitized Display surface here. Avoid echoing
+    // raw paths or validation specifics back to users.
     // -------------------------------------------------------------------------
     println!("\n--- Error handling pattern ---");
-    match Config::from_file("nonexistent/path/config.toml").await {
+    match config_api.load_file("nonexistent/path/config.toml").await {
         Ok(_) => unreachable!(),
         Err(e) => {
             // Safe to show to users / API callers:
             println!("Public error  : {e}");
-
-            // Contains operation, metadata, path — keep internal:
-            // println!("Internal log  : {:?}", e.internal_log()); // DO NOT forward externally
         }
     }
 }

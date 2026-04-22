@@ -18,17 +18,27 @@ fn main() {
     // -------------------------------------------------------------------------
     let config = Config::default();
 
-    let rt_config = config.to_runtime()
+    let rt_config = config
+        .to_runtime()
         .expect("Default config must convert to runtime successfully");
 
     println!("=== RuntimeConfig (stack-only) ===");
     println!("  hostname             : {}", rt_config.hostname);
     println!("  decoy_paths count    : {}", rt_config.decoy_paths.len());
     println!("  watch_paths count    : {}", rt_config.watch_paths.len());
-    println!("  credential_types     : {:?}",
-        rt_config.credential_types.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    println!(
+        "  credential_types     : {:?}",
+        rt_config
+            .credential_types
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+    );
     println!("  honeytoken_count     : {}", rt_config.honeytoken_count);
-    println!("  artifact_permissions : {:o}", rt_config.artifact_permissions);
+    println!(
+        "  artifact_permissions : {:o}",
+        rt_config.artifact_permissions
+    );
 
     // -------------------------------------------------------------------------
     // 2. Derive artifact tags — zero heap allocation
@@ -60,14 +70,27 @@ fn main() {
     // -------------------------------------------------------------------------
     let policy = PolicyConfig::default();
 
-    let rt_policy = policy.to_runtime()
+    let rt_policy = policy
+        .to_runtime()
         .expect("Default policy must convert to runtime successfully");
 
     println!("\n=== RuntimePolicy (stack-only) ===");
-    println!("  alert_threshold           : {}", rt_policy.alert_threshold);
-    println!("  suspicious_processes count: {}", rt_policy.suspicious_processes.len());
-    println!("  suspicious_patterns count : {}", rt_policy.suspicious_patterns.len());
-    println!("  custom_conditions count   : {}", rt_policy.registered_custom_conditions.len());
+    println!(
+        "  alert_threshold           : {}",
+        rt_policy.alert_threshold
+    );
+    println!(
+        "  suspicious_processes count: {}",
+        rt_policy.suspicious_processes.len()
+    );
+    println!(
+        "  suspicious_patterns count : {}",
+        rt_policy.suspicious_patterns.len()
+    );
+    println!(
+        "  custom_conditions count   : {}",
+        rt_policy.registered_custom_conditions.len()
+    );
 
     // -------------------------------------------------------------------------
     // 4. Hot-path suspicious process check
@@ -77,14 +100,14 @@ fn main() {
     // -------------------------------------------------------------------------
     println!("\n=== Hot-Path Suspicious Process Checks ===");
     let test_cases = [
-        ("mimikatz.exe",   true),
-        ("MIMIKATZ.EXE",   true),
-        ("MiMiKaTz",       true),
-        ("procdump64.exe", true),   // substring match on "procdump"
-        ("LaZagne.py",     true),   // substring match on "lazagne" (stored lowercase)
-        ("svchost.exe",    false),
-        ("notepad.exe",    false),
-        ("chrome.exe",     false),
+        ("mimikatz.exe", true),
+        ("MIMIKATZ.EXE", true),
+        ("MiMiKaTz", true),
+        ("procdump64.exe", true), // substring match on "procdump"
+        ("LaZagne.py", true),     // substring match on "lazagne" (stored lowercase)
+        ("svchost.exe", false),
+        ("notepad.exe", false),
+        ("chrome.exe", false),
     ];
 
     for (name, expected) in test_cases {
@@ -97,8 +120,10 @@ fn main() {
     // 5. Custom condition registration check
     // -------------------------------------------------------------------------
     println!("\n=== Custom Condition Checks ===");
-    println!("  is_registered('never_registered') = {}",
-        rt_policy.is_registered_custom_condition("never_registered"));
+    println!(
+        "  is_registered('never_registered') = {}",
+        rt_policy.is_registered_custom_condition("never_registered")
+    );
 
     // -------------------------------------------------------------------------
     // 6. Simulated high-frequency event loop (demonstrates no-alloc pattern)
@@ -124,7 +149,7 @@ fn main() {
 
     for i in 0..10_000usize {
         let process_name = process_names[i % process_names.len()];
-        let artifact_id  = format!("artifact-{}", i % 16); // small heap alloc for demo ID only
+        let artifact_id = format!("artifact-{}", i % 16); // small heap alloc for demo ID only
 
         // Hot path: no allocation
         rt_config.derive_artifact_tag_hex_into(&artifact_id, &mut tag_buf);
@@ -155,6 +180,6 @@ fn main() {
 
     match big_config.to_runtime() {
         Err(e) => println!("  [OK] Correctly rejected 70 decoy paths (max=64): {e}"),
-        Ok(_)  => println!("  [UNEXPECTED] Accepted 70 paths — check MAX_PATH_ENTRIES"),
+        Ok(_) => println!("  [UNEXPECTED] Accepted 70 paths — check MAX_PATH_ENTRIES"),
     }
 }

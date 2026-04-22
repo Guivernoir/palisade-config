@@ -1,7 +1,7 @@
-//! # Example 07 — Timing Profiles
+//! # Example 07 — Timing Floors
 //!
-//! Demonstrates the global timing profile system used to enforce minimum
-//! operation latencies, preventing timing side-channel attacks.
+//! Demonstrates the global timing-floor system used to enforce minimum
+//! operation latencies, preventing coarse timing side-channel attacks.
 //!
 //! ## Why Timing Floors?
 //!
@@ -13,16 +13,11 @@
 //! Timing floors normalise all these operations to a predictable minimum,
 //! making timing correlation attacks statistically useless.
 //!
-//! ## Profiles
-//!
-//! | Profile   | Overhead | Use Case                              |
-//! |-----------|----------|---------------------------------------|
-//! | Balanced  | ~μs      | Development, staging, low-risk envs   |
-//! | Hardened  | ~1.5–2×  | Production, internet-facing honeypots |
-
 use palisade_config::{
-    get_timing_profile, set_timing_profile, Config, PolicyConfig, RootTag, TimingProfile,
+    Config, ConfigApi, DEFAULT_TIMING_FLOOR, PolicyApi, PolicyConfig, RootTag, get_timing_floor,
+    set_timing_floor,
 };
+use std::time::Duration;
 use std::time::Instant;
 
 fn time_operation<F: Fn()>(label: &str, iterations: u32, f: F) -> std::time::Duration {
@@ -37,21 +32,21 @@ fn time_operation<F: Fn()>(label: &str, iterations: u32, f: F) -> std::time::Dur
 }
 
 fn main() {
-    println!("=== Timing Profile Fundamentals ===");
-    println!("  Initial profile: {:?}", get_timing_profile());
+    println!("=== Timing Floor Fundamentals ===");
+    println!("  Initial floor: {:?}", get_timing_floor());
 
     // -------------------------------------------------------------------------
-    // 1. Switch to Balanced (default)
+    // 1. Start from the default floor
     // -------------------------------------------------------------------------
-    set_timing_profile(TimingProfile::Balanced);
-    assert_eq!(get_timing_profile(), TimingProfile::Balanced);
-    println!("  Set to Balanced: {:?}", get_timing_profile());
+    set_timing_floor(DEFAULT_TIMING_FLOOR);
+    assert_eq!(get_timing_floor(), DEFAULT_TIMING_FLOOR);
+    println!("  Set to default: {:?}", get_timing_floor());
 
     // -------------------------------------------------------------------------
-    // 2. Measure key operations under Balanced profile
+    // 2. Measure key operations under the default floor
     // -------------------------------------------------------------------------
-    println!("\n=== Balanced Profile — Operation Timings ===");
-    println!("  (floors: RootTagNew≥18μs, HashCompare≥1μs, SuspiciousCheck≥8μs)");
+    println!("\n=== Default Floor — Operation Timings ===");
+    println!("  (floor applied crate-wide: {:?})", get_timing_floor());
 
     let root = RootTag::generate().expect("generate");
     let policy = PolicyConfig::default();
@@ -73,19 +68,21 @@ fn main() {
         let _ = rt_policy.is_suspicious_process("MIMIKATZ.exe");
     });
 
-    let balanced_tag_derive = time_operation("RuntimeConfig::derive_artifact_tag_hex_into()", 50, || {
-        let mut buf = [0u8; 128];
-        rt_config.derive_artifact_tag_hex_into("artifact-001", &mut buf);
-    });
+    let balanced_tag_derive =
+        time_operation("RuntimeConfig::derive_artifact_tag_hex_into()", 50, || {
+            let mut buf = [0u8; 128];
+            rt_config.derive_artifact_tag_hex_into("artifact-001", &mut buf);
+        });
 
     // -------------------------------------------------------------------------
-    // 3. Switch to Hardened and remeasure
+    // 3. Raise the floor and remeasure
     // -------------------------------------------------------------------------
-    set_timing_profile(TimingProfile::Hardened);
-    assert_eq!(get_timing_profile(), TimingProfile::Hardened);
+    let hardened_floor = Duration::from_micros(250);
+    set_timing_floor(hardened_floor);
+    assert_eq!(get_timing_floor(), hardened_floor);
 
-    println!("\n=== Hardened Profile — Operation Timings ===");
-    println!("  (floors: RootTagNew≥28μs, HashCompare≥2μs, SuspiciousCheck≥12μs)");
+    println!("\n=== Raised Floor — Operation Timings ===");
+    println!("  (floor applied crate-wide: {:?})", get_timing_floor());
 
     let hardened_tag_new = time_operation("RootTag::generate()", 5, || {
         let _ = RootTag::generate().expect("generate");
@@ -100,40 +97,63 @@ fn main() {
         let _ = rt_policy.is_suspicious_process("MIMIKATZ.exe");
     });
 
-    let hardened_tag_derive = time_operation("RuntimeConfig::derive_artifact_tag_hex_into()", 50, || {
-        let mut buf = [0u8; 128];
-        rt_config.derive_artifact_tag_hex_into("artifact-001", &mut buf);
-    });
+    let hardened_tag_derive =
+        time_operation("RuntimeConfig::derive_artifact_tag_hex_into()", 50, || {
+            let mut buf = [0u8; 128];
+            rt_config.derive_artifact_tag_hex_into("artifact-001", &mut buf);
+        });
 
     // -------------------------------------------------------------------------
-    // 4. Compare ratios — Hardened should be consistently higher
+    // 4. Compare ratios — the higher floor should be consistently slower
     // -------------------------------------------------------------------------
-    println!("\n=== Profile Comparison ===");
-    println!("  {:40}  {:>12}  {:>12}  {:>8}",
-        "Operation", "Balanced", "Hardened", "Ratio");
-    println!("  {:40}  {:>12}  {:>12}  {:>8}",
-        "---------", "--------", "--------", "-----");
+    println!("\n=== Floor Comparison ===");
+    println!(
+        "  {:40}  {:>12}  {:>12}  {:>8}",
+        "Operation", "Default", "Raised", "Ratio"
+    );
+    println!(
+        "  {:40}  {:>12}  {:>12}  {:>8}",
+        "---------", "--------", "--------", "-----"
+    );
 
     fn ratio(h: std::time::Duration, b: std::time::Duration) -> f64 {
-        if b.as_nanos() == 0 { return 0.0; }
+        if b.as_nanos() == 0 {
+            return 0.0;
+        }
         h.as_nanos() as f64 / b.as_nanos() as f64
     }
 
-    println!("  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
+    println!(
+        "  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
         "RootTag::generate()",
-        balanced_tag_new, hardened_tag_new, ratio(hardened_tag_new, balanced_tag_new));
+        balanced_tag_new,
+        hardened_tag_new,
+        ratio(hardened_tag_new, balanced_tag_new)
+    );
 
-    println!("  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
+    println!(
+        "  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
         "hash_eq_ct()",
-        balanced_hash_cmp, hardened_hash_cmp, ratio(hardened_hash_cmp, balanced_hash_cmp));
+        balanced_hash_cmp,
+        hardened_hash_cmp,
+        ratio(hardened_hash_cmp, balanced_hash_cmp)
+    );
 
-    println!("  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
+    println!(
+        "  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
         "is_suspicious_process()",
-        balanced_suspicious, hardened_suspicious, ratio(hardened_suspicious, balanced_suspicious));
+        balanced_suspicious,
+        hardened_suspicious,
+        ratio(hardened_suspicious, balanced_suspicious)
+    );
 
-    println!("  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
+    println!(
+        "  {:40}  {:>12?}  {:>12?}  {:>7.2}×",
         "derive_artifact_tag_hex_into()",
-        balanced_tag_derive, hardened_tag_derive, ratio(hardened_tag_derive, balanced_tag_derive));
+        balanced_tag_derive,
+        hardened_tag_derive,
+        ratio(hardened_tag_derive, balanced_tag_derive)
+    );
 
     // -------------------------------------------------------------------------
     // 5. Timing floor semantics — floors are MINIMUMS, not exact targets
@@ -149,42 +169,45 @@ fn main() {
     println!("  Either way: external observer sees a consistent lower bound.");
 
     // -------------------------------------------------------------------------
-    // 6. Concurrent profile reads — atomic, lock-free, safe from multiple threads
+    // 6. Concurrent floor reads — atomic, lock-free, safe from multiple threads
     // -------------------------------------------------------------------------
-    println!("\n=== Thread-Safety of Profile Reads ===");
-    set_timing_profile(TimingProfile::Balanced);
+    println!("\n=== Thread-Safety of Floor Reads ===");
+    set_timing_floor(DEFAULT_TIMING_FLOOR);
 
-    let handles: Vec<_> = (0..4).map(|i| {
-        std::thread::spawn(move || {
-            let profile = get_timing_profile();
-            println!("  Thread {i}: profile = {:?}", profile);
-            profile
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let floor = get_timing_floor();
+                println!("  Thread {i}: floor = {:?}", floor);
+                floor
+            })
         })
-    }).collect();
+        .collect();
 
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    assert!(results.iter().all(|&p| p == TimingProfile::Balanced),
-        "All threads must read the same profile");
+    assert!(
+        results.iter().all(|&floor| floor == DEFAULT_TIMING_FLOOR),
+        "All threads must read the same floor"
+    );
     println!("  All threads consistent: ✓");
 
     // -------------------------------------------------------------------------
-    // 7. Recommended profile selection logic
+    // 7. API-level timing normalization on top of the global floor
     // -------------------------------------------------------------------------
-    println!("\n=== Profile Selection Recommendation ===");
-    let is_production = std::env::var("PALISADE_ENV")
-        .map(|v| v == "production")
-        .unwrap_or(false);
+    println!("\n=== API-Level Timing Normalization ===");
+    let config_api = ConfigApi::new().with_timing_floor(Duration::from_millis(1));
+    let policy_api = PolicyApi::new().with_timing_floor(Duration::from_millis(1));
+    let cfg = Config::default();
+    let policy = PolicyConfig::default();
 
-    let selected = if is_production {
-        TimingProfile::Hardened
-    } else {
-        TimingProfile::Balanced
-    };
+    let config_timing = time_operation("ConfigApi::to_runtime()", 10, || {
+        let _ = config_api.to_runtime(&cfg).expect("runtime");
+    });
+    let policy_timing = time_operation("PolicyApi::validate()", 10, || {
+        policy_api.validate(&policy).expect("validate");
+    });
 
-    set_timing_profile(selected);
-    println!("  PALISADE_ENV={:?}", std::env::var("PALISADE_ENV").unwrap_or("(not set)".into()));
-    println!("  Selected profile: {:?}", get_timing_profile());
-    println!("  Tip: set PALISADE_ENV=production to activate Hardened mode.");
-
-    println!("\nTiming profile examples completed.");
+    println!("  Config API floor observed : {:?}", config_timing);
+    println!("  Policy API floor observed : {:?}", policy_timing);
+    println!("\nTiming floor examples completed.");
 }

@@ -1,32 +1,46 @@
 # Benchmark Analysis Script Usage
 
-Script: `scripts/analyze_bench_results.py`
+## Purpose
+
+`scripts/analyze_bench_results.py` converts raw benchmark output into a compact
+set of structured artifacts suitable for comparative review:
+
+- parsed row data
+- aggregate summaries
+- ranking views
+- visual distributions
+
+The script is intended to support performance interpretation, not to replace a
+formal benchmarking methodology.
 
 ## Prerequisites
 
-1. Python 3.9+.
-2. `matplotlib` installed:
+- Python 3.9 or newer
+- `matplotlib`
+
+Install the plotting dependency with:
 
 ```bash
 python3 -m pip install matplotlib
 ```
 
-## Basic Usage
+## Canonical Invocation
 
-Run with defaults:
+Run with default settings:
 
 ```bash
 python3 scripts/analyze_bench_results.py
 ```
 
-Defaults used:
-- Input: `palisade_benchmark_results.txt`
-- Output directory: `benchmark_analysis`
-- Top N for ranked charts: `12`
+Default parameters:
 
-## Common Examples
+- input file: `palisade_benchmark_results.txt`
+- output directory: `benchmark_analysis`
+- ranked chart depth: `12`
 
-Analyze a specific file and output directory:
+## Common Variants
+
+Analyze a specific input file and destination directory:
 
 ```bash
 python3 scripts/analyze_bench_results.py \
@@ -34,31 +48,48 @@ python3 scripts/analyze_bench_results.py \
   --outdir benchmark_analysis
 ```
 
-Generate charts with larger top-N ranking:
+Increase the top-N depth in ranked charts:
 
 ```bash
 python3 scripts/analyze_bench_results.py --top-n 20
 ```
 
-Keep analyses per run:
+Preserve each run independently:
 
 ```bash
-python3 scripts/analyze_bench_results.py --outdir benchmark_analysis_$(date +%Y%m%d_%H%M%S)
+python3 scripts/analyze_bench_results.py \
+  --outdir benchmark_analysis_$(date +%Y%m%d_%H%M%S)
 ```
 
-## Outputs
+## Output Set
 
-After running, you get:
+The script produces:
 
-- `benchmark_analysis/parsed_rows.csv`: row-level parsed benchmark data
-- `benchmark_analysis/summary.csv`: per-label aggregate metrics
-- `benchmark_analysis/summary.json`: same summary in JSON
+- `benchmark_analysis/parsed_rows.csv`
+- `benchmark_analysis/summary.csv`
+- `benchmark_analysis/summary.json`
 - `benchmark_analysis/charts/time_distribution.png`
 - `benchmark_analysis/charts/alloc_median_top.png`
 - `benchmark_analysis/charts/time_vs_alloc.png`
 - `benchmark_analysis/charts/zero_alloc_status.png`
 
-## Example Quick Checks
+## Interpretation Guidance
+
+The most useful reading sequence is:
+
+1. `summary.csv` for ranked numerical review
+2. `time_distribution.png` for timing spread
+3. `alloc_median_top.png` for allocation outliers
+4. `zero_alloc_status.png` for hot-path allocation posture
+
+Questions the artifacts help answer:
+
+- which operations dominate median latency
+- which operations allocate unexpectedly
+- whether "zero-allocation" claims hold in measured practice
+- where optimization effort is likely to have the best operational return
+
+## Quick Checks
 
 Top 10 benchmarks by median allocation bytes:
 
@@ -67,25 +98,36 @@ python3 - <<'PY'
 import csv
 rows = []
 with open("benchmark_analysis/summary.csv", newline="", encoding="utf-8") as f:
-    for r in csv.DictReader(f):
-        rows.append((r["label"], float(r["alloc_bytes_median"])))
-rows.sort(key=lambda x: x[1], reverse=True)
+    for row in csv.DictReader(f):
+        rows.append((row["label"], float(row["alloc_bytes_median"])))
+rows.sort(key=lambda item: item[1], reverse=True)
 for label, alloc in rows[:10]:
     print(f"{alloc:10.0f}  {label}")
 PY
 ```
 
-Top 10 slowest by median time:
+Top 10 slowest benchmarks by median time:
 
 ```bash
 python3 - <<'PY'
 import csv
 rows = []
 with open("benchmark_analysis/summary.csv", newline="", encoding="utf-8") as f:
-    for r in csv.DictReader(f):
-        rows.append((r["label"], float(r["time_ns_median"]) / 1000.0))
-rows.sort(key=lambda x: x[1], reverse=True)
+    for row in csv.DictReader(f):
+        rows.append((row["label"], float(row["time_ns_median"]) / 1000.0))
+rows.sort(key=lambda item: item[1], reverse=True)
 for label, time_us in rows[:10]:
     print(f"{time_us:10.2f} us  {label}")
 PY
 ```
+
+## Limitations
+
+This script assumes:
+
+- the benchmark text format matches the parser's expectations
+- the benchmark runs themselves were obtained under a controlled methodology
+- charts are used as review aids rather than as standalone proof
+
+For credible performance claims, keep raw benchmark inputs, environment notes,
+compiler flags, and commit identifiers alongside the generated analysis.

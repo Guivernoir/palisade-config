@@ -2,8 +2,8 @@
 //!
 //! Demonstrates the complete lifecycle of a honeypot agent:
 //!
-//!   1. Timing profile selection (before anything else)
-//!   2. Config + policy load with strict validation
+//!   1. Timing-floor selection (before anything else)
+//!   2. Config + policy load with embedded validation
 //!   3. Runtime conversion (heap → stack for hot paths)
 //!   4. Artifact tag derivation (cryptographic binding)
 //!   5. Simulated event processing loop
@@ -14,18 +14,19 @@
 //! an agent binary.
 
 use palisade_config::{
-    get_timing_profile, set_timing_profile, Config, PolicyConfig,
-    RuntimeConfig, RuntimePolicy, Severity, TimingProfile,
+    Config, ConfigApi, DEFAULT_TIMING_FLOOR, PolicyApi, PolicyConfig, RuntimeConfig, RuntimePolicy,
+    Severity, ValidationMode, get_timing_floor, set_timing_floor,
 };
+use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Simulated event from the OS (inotify / eBPF / audit subsystem)
 // ─────────────────────────────────────────────────────────────────────────────
 #[derive(Debug)]
 struct FileAccessEvent<'a> {
-    artifact_id:  &'a str,
+    artifact_id: &'a str,
     process_name: &'a str,
-    pid:          u32,
+    pid: u32,
     is_off_hours: bool,
 }
 
@@ -34,17 +35,17 @@ struct FileAccessEvent<'a> {
 // ─────────────────────────────────────────────────────────────────────────────
 #[derive(Debug)]
 struct Incident<'a> {
-    event:    &'a FileAccessEvent<'a>,
-    score:    f64,
+    event: &'a FileAccessEvent<'a>,
+    score: f64,
     severity: Severity,
-    tag:      [u8; 128], // stack-allocated artifact tag
+    tag: [u8; 128], // stack-allocated artifact tag
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hot-path event processor — zero heap allocation per event
 // ─────────────────────────────────────────────────────────────────────────────
 fn process_event<'a>(
-    event:     &'a FileAccessEvent<'a>,
+    event: &'a FileAccessEvent<'a>,
     rt_config: &RuntimeConfig,
     rt_policy: &RuntimePolicy,
 ) -> Option<Incident<'a>> {
@@ -79,15 +80,20 @@ fn process_event<'a>(
 #[tokio::main]
 async fn main() {
     // =========================================================================
-    // PHASE 1 — Timing profile (must be first — affects all subsequent calls)
+    // PHASE 1 — Timing floor (must be first — affects all subsequent calls)
     // =========================================================================
-    let profile = if std::env::var("PALISADE_ENV").as_deref() == Ok("production") {
-        TimingProfile::Hardened
+    let timing_floor = if std::env::var("PALISADE_ENV").as_deref() == Ok("production") {
+        Duration::from_micros(250)
     } else {
-        TimingProfile::Balanced
+        DEFAULT_TIMING_FLOOR
     };
-    set_timing_profile(profile);
-    println!("[STARTUP] Timing profile: {:?}", get_timing_profile());
+    set_timing_floor(timing_floor);
+    println!("[STARTUP] Timing floor: {:?}", get_timing_floor());
+
+    let config_api = ConfigApi::new()
+        .with_validation_mode(ValidationMode::Strict)
+        .with_timing_floor(timing_floor);
+    let policy_api = PolicyApi::new().with_timing_floor(timing_floor);
 
     // =========================================================================
     // PHASE 2 — Configuration load
@@ -98,7 +104,8 @@ async fn main() {
     println!("[STARTUP] Loading configuration...");
 
     let config = if std::path::Path::new("examples/config.toml").exists() {
-        Config::from_file("examples/config.toml")
+        config_api
+            .load_file("examples/config.toml")
             .await
             .expect("Config load failed")
     } else {
@@ -107,7 +114,8 @@ async fn main() {
     };
 
     let policy = if std::path::Path::new("examples/policy.toml").exists() {
-        PolicyConfig::from_file("examples/policy.toml")
+        policy_api
+            .load_file("examples/policy.toml")
             .await
             .expect("Policy load failed")
     } else {
@@ -115,8 +123,12 @@ async fn main() {
         PolicyConfig::default()
     };
 
-    config.validate().expect("Config validation failed");
-    policy.validate().expect("Policy validation failed");
+    config_api
+        .validate(&config)
+        .expect("Config validation failed");
+    policy_api
+        .validate(&policy)
+        .expect("Policy validation failed");
     println!("[STARTUP] Config and policy loaded and validated.");
 
     // =========================================================================
@@ -124,15 +136,20 @@ async fn main() {
     // =========================================================================
     println!("[STARTUP] Converting to no-alloc runtime representations...");
 
-    let rt_config = config.to_runtime()
+    let rt_config = config_api
+        .to_runtime(&config)
         .expect("Config runtime conversion failed");
-    let rt_policy = policy.to_runtime()
+    let rt_policy = policy_api
+        .to_runtime(&policy)
         .expect("Policy runtime conversion failed");
 
     println!("  hostname           : {}", rt_config.hostname);
     println!("  decoy_paths        : {}", rt_config.decoy_paths.len());
     println!("  watch_paths        : {}", rt_config.watch_paths.len());
-    println!("  suspicious_procs   : {}", rt_policy.suspicious_processes.len());
+    println!(
+        "  suspicious_procs   : {}",
+        rt_policy.suspicious_processes.len()
+    );
     println!("  alert_threshold    : {}", rt_policy.alert_threshold);
 
     // =========================================================================
@@ -158,27 +175,27 @@ async fn main() {
 
     let events = vec![
         FileAccessEvent {
-            artifact_id:  "/tmp/.credentials",
+            artifact_id: "/tmp/.credentials",
             process_name: "curl",
-            pid:          1234,
+            pid: 1234,
             is_off_hours: false,
         },
         FileAccessEvent {
-            artifact_id:  "/tmp/.credentials",
-            process_name: "MIMIKATZ.exe",   // suspicious
-            pid:          5678,
-            is_off_hours: true,             // and off-hours
+            artifact_id: "/tmp/.credentials",
+            process_name: "MIMIKATZ.exe", // suspicious
+            pid: 5678,
+            is_off_hours: true, // and off-hours
         },
         FileAccessEvent {
-            artifact_id:  "/opt/.backup",
+            artifact_id: "/opt/.backup",
             process_name: "procdump64.exe", // suspicious
-            pid:          9012,
+            pid: 9012,
             is_off_hours: false,
         },
         FileAccessEvent {
-            artifact_id:  "/opt/.backup",
+            artifact_id: "/opt/.backup",
             process_name: "rsync",
-            pid:          3456,
+            pid: 3456,
             is_off_hours: false,
         },
     ];
@@ -216,14 +233,18 @@ async fn main() {
     // =========================================================================
     println!("\n[HOT-RELOAD] Simulating config reload...");
 
-    let new_config  = Config::default();
-    let new_policy  = PolicyConfig::default();
+    let new_config = Config::default();
+    let new_policy = PolicyConfig::default();
 
-    new_config.validate().expect("Reloaded config invalid");
-    new_policy.validate().expect("Reloaded policy invalid");
+    config_api
+        .validate(&new_config)
+        .expect("Reloaded config invalid");
+    policy_api
+        .validate(&new_policy)
+        .expect("Reloaded policy invalid");
 
-    let config_changes = config.diff(&new_config);
-    let policy_changes = policy.diff(&new_policy);
+    let config_changes = config_api.diff(&config, &new_config).expect("config diff");
+    let policy_changes = policy_api.diff(&policy, &new_policy).expect("policy diff");
 
     println!("  Config changes detected: {}", config_changes.len());
     for c in &config_changes {
@@ -245,8 +266,8 @@ async fn main() {
     if safe_to_reload {
         println!("  Hot-reload: APPLIED (safe diff)");
         // In production: atomically swap Arc<RuntimeConfig> / Arc<RuntimePolicy>
-        let _new_rt_config = new_config.to_runtime().expect("runtime");
-        let _new_rt_policy = new_policy.to_runtime().expect("runtime");
+        let _new_rt_config = config_api.to_runtime(&new_config).expect("runtime");
+        let _new_rt_policy = policy_api.to_runtime(&new_policy).expect("runtime");
     } else {
         println!("  Hot-reload: BLOCKED (would eliminate all response rules — requires restart)");
     }

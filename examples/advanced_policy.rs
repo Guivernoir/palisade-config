@@ -8,8 +8,8 @@
 //!   - Severity score mapping
 
 use palisade_config::{
-    ActionType, DeceptionPolicy, PolicyConfig, ResponseCondition, ResponsePolicy,
-    ResponseRule, ScoringPolicy, ScoringWeights, Severity,
+    ActionType, DeceptionPolicy, PolicyConfig, ResponseCondition, ResponsePolicy, ResponseRule,
+    ScoringPolicy, ScoringWeights, Severity,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -22,25 +22,43 @@ fn main() {
     // a much stronger signal than process ancestry.
     // -------------------------------------------------------------------------
     let financial_weights = ScoringWeights {
-        artifact_access:     60.0, // primary trigger — any access is suspicious
-        suspicious_process:  35.0, // attacker tooling is definitive
-        rapid_enumeration:   25.0, // scanning behaviour
-        off_hours_activity:  30.0, // ELEVATED: financial systems don't operate at 3am
-        ancestry_suspicious: 5.0,  // REDUCED: containerised environment, ancestry unreliable
+        artifact_access: 60.0,    // primary trigger — any access is suspicious
+        suspicious_process: 35.0, // attacker tooling is definitive
+        rapid_enumeration: 25.0,  // scanning behaviour
+        off_hours_activity: 30.0, // ELEVATED: financial systems don't operate at 3am
+        ancestry_suspicious: 5.0, // REDUCED: containerised environment, ancestry unreliable
     };
 
     println!("=== Custom Scoring Weights (Financial Sector) ===");
-    println!("  artifact_access     : {:.1}", financial_weights.artifact_access);
-    println!("  suspicious_process  : {:.1}", financial_weights.suspicious_process);
-    println!("  rapid_enumeration   : {:.1}", financial_weights.rapid_enumeration);
-    println!("  off_hours_activity  : {:.1}", financial_weights.off_hours_activity);
-    println!("  ancestry_suspicious : {:.1}", financial_weights.ancestry_suspicious);
+    println!(
+        "  artifact_access     : {:.1}",
+        financial_weights.artifact_access
+    );
+    println!(
+        "  suspicious_process  : {:.1}",
+        financial_weights.suspicious_process
+    );
+    println!(
+        "  rapid_enumeration   : {:.1}",
+        financial_weights.rapid_enumeration
+    );
+    println!(
+        "  off_hours_activity  : {:.1}",
+        financial_weights.off_hours_activity
+    );
+    println!(
+        "  ancestry_suspicious : {:.1}",
+        financial_weights.ancestry_suspicious
+    );
 
     // Compute what a combined score might look like
     let simulated_score = financial_weights.artifact_access
         + financial_weights.off_hours_activity
         + financial_weights.suspicious_process;
-    println!("\n  Example: off-hours access by mimikatz = {:.1} points", simulated_score);
+    println!(
+        "\n  Example: off-hours access by mimikatz = {:.1} points",
+        simulated_score
+    );
     println!("  Severity: {}", Severity::from_score(simulated_score));
 
     // -------------------------------------------------------------------------
@@ -60,16 +78,12 @@ fn main() {
             conditions: vec![],
             action: ActionType::Log,
         },
-
         // Medium: alert if confidence is reasonable
         ResponseRule {
             severity: Severity::Medium,
-            conditions: vec![
-                ResponseCondition::MinConfidence { threshold: 40.0 },
-            ],
+            conditions: vec![ResponseCondition::MinConfidence { threshold: 40.0 }],
             action: ActionType::Alert,
         },
-
         // High: kill process only if:
         //   - high confidence, AND
         //   - not parented by monitoring agent (prevent false kills), AND
@@ -78,12 +92,13 @@ fn main() {
             severity: Severity::High,
             conditions: vec![
                 ResponseCondition::MinConfidence { threshold: 65.0 },
-                ResponseCondition::NotParentedBy { process_name: "palisade-agent".to_string() },
+                ResponseCondition::NotParentedBy {
+                    process_name: "palisade-agent".to_string(),
+                },
                 ResponseCondition::MinSignalTypes { count: 2 },
             ],
             action: ActionType::KillProcess,
         },
-
         // Critical: isolate host only if:
         //   - very high confidence, AND
         //   - repeated incidents (not a one-off), AND
@@ -93,8 +108,14 @@ fn main() {
             severity: Severity::Critical,
             conditions: vec![
                 ResponseCondition::MinConfidence { threshold: 85.0 },
-                ResponseCondition::RepeatCount { count: 3, window_secs: 600 },
-                ResponseCondition::TimeWindow { start_hour: 18, end_hour: 8 },  // 18:00–08:00
+                ResponseCondition::RepeatCount {
+                    count: 3,
+                    window_secs: 600,
+                },
+                ResponseCondition::TimeWindow {
+                    start_hour: 18,
+                    end_hour: 8,
+                }, // 18:00–08:00
                 ResponseCondition::Custom {
                     name: "geo_block_non_corporate".to_string(),
                     params: {
@@ -113,22 +134,33 @@ fn main() {
     ];
 
     for rule in &rules {
-        println!("  severity={:?}  action={:?}  conditions={}",
-            rule.severity, rule.action, rule.conditions.len());
+        println!(
+            "  severity={:?}  action={:?}  conditions={}",
+            rule.severity,
+            rule.action,
+            rule.conditions.len()
+        );
         for cond in &rule.conditions {
             match cond {
-                ResponseCondition::MinConfidence { threshold } =>
-                    println!("    - min_confidence >= {threshold:.1}"),
-                ResponseCondition::NotParentedBy { process_name } =>
-                    println!("    - not_parented_by '{process_name}'"),
-                ResponseCondition::MinSignalTypes { count } =>
-                    println!("    - min_signal_types >= {count}"),
-                ResponseCondition::RepeatCount { count, window_secs } =>
-                    println!("    - repeat_count >= {count} within {window_secs}s"),
-                ResponseCondition::TimeWindow { start_hour, end_hour } =>
-                    println!("    - time_window {start_hour:02}:00–{end_hour:02}:00"),
-                ResponseCondition::Custom { name, params } =>
-                    println!("    - custom '{name}' params={:?}", params),
+                ResponseCondition::MinConfidence { threshold } => {
+                    println!("    - min_confidence >= {threshold:.1}")
+                }
+                ResponseCondition::NotParentedBy { process_name } => {
+                    println!("    - not_parented_by '{process_name}'")
+                }
+                ResponseCondition::MinSignalTypes { count } => {
+                    println!("    - min_signal_types >= {count}")
+                }
+                ResponseCondition::RepeatCount { count, window_secs } => {
+                    println!("    - repeat_count >= {count} within {window_secs}s")
+                }
+                ResponseCondition::TimeWindow {
+                    start_hour,
+                    end_hour,
+                } => println!("    - time_window {start_hour:02}:00–{end_hour:02}:00"),
+                ResponseCondition::Custom { name, params } => {
+                    println!("    - custom '{name}' params={:?}", params)
+                }
             }
         }
     }
@@ -151,9 +183,9 @@ fn main() {
         },
         response: ResponsePolicy {
             rules: rules,
-            cooldown_secs: 120,         // 2 min cooldown in financial env
-            max_kills_per_incident: 5,  // conservative kill limit
-            dry_run: true,              // SAFE ROLLOUT: log only
+            cooldown_secs: 120,        // 2 min cooldown in financial env
+            max_kills_per_incident: 5, // conservative kill limit
+            dry_run: true,             // SAFE ROLLOUT: log only
         },
         deception: DeceptionPolicy {
             suspicious_processes: vec![
@@ -179,13 +211,18 @@ fn main() {
         registered_custom_conditions: custom_conditions,
     };
 
-    println!("  dry_run: {} (actions logged but NOT executed)", policy.response.dry_run);
+    println!(
+        "  dry_run: {} (actions logged but NOT executed)",
+        policy.response.dry_run
+    );
     policy.validate().expect("Policy must be valid");
     println!("  validation: PASSED");
 
     // Flip off dry-run for production
     policy.response.dry_run = false;
-    policy.validate().expect("Policy still valid after disabling dry-run");
+    policy
+        .validate()
+        .expect("Policy still valid after disabling dry-run");
     println!("  dry_run disabled: still valid ✓");
 
     // -------------------------------------------------------------------------
@@ -198,7 +235,10 @@ fn main() {
     println!("\n=== Custom Condition Security ===");
 
     let mut unsafe_policy = PolicyConfig::default();
-    unsafe_policy.response.rules.retain(|r| r.severity != Severity::Low);
+    unsafe_policy
+        .response
+        .rules
+        .retain(|r| r.severity != Severity::Low);
     unsafe_policy.response.rules.push(ResponseRule {
         severity: Severity::Low,
         conditions: vec![ResponseCondition::Custom {
@@ -210,13 +250,15 @@ fn main() {
 
     match unsafe_policy.validate() {
         Err(e) => println!("  [OK] Unregistered condition rejected: {e}"),
-        Ok(_)  => println!("  [FAIL] Security check bypassed!"),
+        Ok(_) => println!("  [FAIL] Security check bypassed!"),
     }
 
     // Registering it makes it valid
-    unsafe_policy.registered_custom_conditions.insert("injected_condition".to_string());
+    unsafe_policy
+        .registered_custom_conditions
+        .insert("injected_condition".to_string());
     match unsafe_policy.validate() {
-        Ok(_)  => println!("  [OK] Registered condition accepted ✓"),
+        Ok(_) => println!("  [OK] Registered condition accepted ✓"),
         Err(e) => println!("  [FAIL] Registration not respected: {e}"),
     }
 
@@ -230,14 +272,14 @@ fn main() {
 
     let mut dup_policy = PolicyConfig::default();
     dup_policy.response.rules.push(ResponseRule {
-        severity: Severity::Low,  // already exists in default
+        severity: Severity::Low, // already exists in default
         conditions: vec![],
         action: ActionType::Alert,
     });
 
     match dup_policy.validate() {
         Err(e) => println!("  [OK] Duplicate severity rejected: {e}"),
-        Ok(_)  => println!("  [FAIL] Duplicate severity accepted!"),
+        Ok(_) => println!("  [FAIL] Duplicate severity accepted!"),
     }
 
     // -------------------------------------------------------------------------

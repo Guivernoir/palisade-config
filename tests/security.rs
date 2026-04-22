@@ -2,10 +2,19 @@
 //!
 //! Tests adversarial inputs, injection attempts, and security properties.
 
-use palisade_config::{Config, PolicyConfig, RootTag, ProtectedString, ProtectedPath};
-use std::path::PathBuf;
+use palisade_config::{Config, PolicyConfig, ProtectedPath, ProtectedString, RootTag};
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use tokio::fs;
+
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms).unwrap();
+}
 
 // ============================================================================
 // TOML INJECTION ATTACK TESTS
@@ -53,7 +62,7 @@ async fn test_toml_injection_in_strings() {
 
     // Should either reject malformed TOML or safely escape the injection
     let result = Config::from_file(&config_path).await;
-    
+
     if let Ok(config) = result {
         // If it parsed, the injection should be escaped in the environment string
         assert!(config.agent.environment.is_some());
@@ -104,12 +113,19 @@ async fn test_path_traversal_in_config_paths() {
     }
 
     let result = Config::from_file(&config_path).await;
-    
+
     if let Ok(config) = result {
         // Paths should be canonicalized or validated
         // The system should accept the path as-is (validation happens at runtime)
         // but the path traversal should still be in the PathBuf
-        assert!(config.agent.work_dir.as_path().to_string_lossy().contains(".."));
+        assert!(
+            config
+                .agent
+                .work_dir
+                .as_path()
+                .to_string_lossy()
+                .contains("..")
+        );
     }
 }
 
@@ -170,7 +186,13 @@ fn test_weak_entropy_rejected() {
         // Repeated pattern
         hex::encode(vec![0xAB, 0xCD].repeat(16)),
         // Low diversity
-        hex::encode(vec![0x42; 31].iter().chain(&[0x43]).copied().collect::<Vec<u8>>()),
+        hex::encode(
+            vec![0x42; 31]
+                .iter()
+                .chain(&[0x43])
+                .copied()
+                .collect::<Vec<u8>>(),
+        ),
     ];
 
     for pattern in weak_patterns {
@@ -183,9 +205,9 @@ fn test_weak_entropy_rejected() {
 fn test_truncated_entropy_rejected() {
     // Too short (less than 256 bits)
     let short_patterns = vec![
-        hex::encode(vec![0x42u8; 16]), // 128 bits
-        hex::encode(vec![0x42u8; 24]), // 192 bits
-        "0123456789abcdef".to_string(),  // Very short
+        hex::encode(vec![0x42u8; 16]),  // 128 bits
+        hex::encode(vec![0x42u8; 24]),  // 192 bits
+        "0123456789abcdef".to_string(), // Very short
     ];
 
     for pattern in short_patterns {
@@ -199,7 +221,7 @@ fn test_invalid_hex_rejected() {
     let invalid_hex = vec![
         "not hex at all",
         "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-        "0123456789abcdefg", // 'g' is invalid
+        "0123456789abcdefg",                  // 'g' is invalid
         "0x0123456789abcdef0123456789abcdef", // 0x prefix not allowed
     ];
 
@@ -242,6 +264,8 @@ async fn test_custom_condition_injection() {
     "#;
 
     fs::write(&policy_path, injection_policy).await.unwrap();
+    #[cfg(unix)]
+    set_owner_only_permissions(&policy_path);
 
     // Should reject unregistered custom condition
     let result = PolicyConfig::from_file(&policy_path).await;
@@ -273,6 +297,8 @@ async fn test_extremely_large_values() {
     "#;
 
     fs::write(&policy_path, exhaustion_policy).await.unwrap();
+    #[cfg(unix)]
+    set_owner_only_permissions(&policy_path);
 
     // Should reject due to validation
     let result = PolicyConfig::from_file(&policy_path).await;
@@ -287,15 +313,15 @@ async fn test_extremely_large_values() {
 fn test_protected_string_zeroizes() {
     let secret = "super_secret_password".to_string();
     let secret_clone = secret.clone();
-    
+
     let protected = ProtectedString::new(secret);
-    
+
     // Verify it contains the secret
     assert_eq!(protected.as_str(), &secret_clone);
-    
+
     // Drop it (zeroize should happen)
     drop(protected);
-    
+
     // We can't directly verify memory is zeroized without unsafe code,
     // but we trust the zeroize crate's implementation
 }
@@ -304,12 +330,12 @@ fn test_protected_string_zeroizes() {
 fn test_protected_path_zeroizes() {
     let path = PathBuf::from("/etc/shadow");
     let path_clone = path.clone();
-    
+
     let protected = ProtectedPath::new(path);
-    
+
     // Verify it contains the path
     assert_eq!(protected.as_path(), path_clone.as_path());
-    
+
     // Drop it (zeroize should happen)
     drop(protected);
 }
@@ -318,13 +344,13 @@ fn test_protected_path_zeroizes() {
 fn test_root_tag_zeroizes() {
     let tag = RootTag::generate().unwrap();
     let hash = *tag.hash();
-    
+
     // Verify hash is accessible
     assert_eq!(hash.len(), 64);
-    
+
     // Drop tag (secret should zeroize)
     drop(tag);
-    
+
     // Can't verify zeroization without unsafe, but hash should still be valid
     assert_eq!(hash.len(), 64);
 }
@@ -333,7 +359,7 @@ fn test_root_tag_zeroizes() {
 fn test_debug_output_redacts_secrets() {
     let protected_string = ProtectedString::new("password123".to_string());
     let debug = format!("{:?}", protected_string);
-    
+
     assert!(!debug.contains("password123"));
     assert!(debug.contains("REDACTED"));
 }
@@ -342,7 +368,7 @@ fn test_debug_output_redacts_secrets() {
 fn test_root_tag_debug_redacts_secret() {
     let tag = RootTag::generate().unwrap();
     let debug = format!("{:?}", tag);
-    
+
     assert!(debug.contains("REDACTED"));
     assert!(!debug.contains(&hex::encode(&[0u8; 32]))); // Shouldn't contain actual secret
 }
@@ -359,14 +385,14 @@ async fn test_concurrent_policy_modifications() {
     let policy = PolicyConfig::default();
     let toml_str = toml::to_string(&policy).unwrap();
     fs::write(&policy_path, &toml_str).await.unwrap();
+    #[cfg(unix)]
+    set_owner_only_permissions(&policy_path);
 
     // Simulate concurrent reads
     let mut handles = vec![];
     for _ in 0..50 {
         let path = policy_path.clone();
-        let handle = tokio::spawn(async move {
-            PolicyConfig::from_file(&path).await
-        });
+        let handle = tokio::spawn(async move { PolicyConfig::from_file(&path).await });
         handles.push(handle);
     }
 
@@ -378,6 +404,52 @@ async fn test_concurrent_policy_modifications() {
 
     // Should not have any panics or data races
     assert_eq!(results.len(), 50);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_config_rejects_symlink_inputs() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let target_path = temp_dir.path().join("real-config.toml");
+    let symlink_path = temp_dir.path().join("config-link.toml");
+
+    let config = Config::default();
+    let toml_str = toml::to_string(&config).unwrap();
+    fs::write(&target_path, &toml_str).await.unwrap();
+    set_owner_only_permissions(&target_path);
+    symlink(&target_path, &symlink_path).unwrap();
+
+    let result = Config::from_file(&symlink_path).await;
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Configuration was rejected for security reasons"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_policy_rejects_symlink_inputs() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = TempDir::new().unwrap();
+    let target_path = temp_dir.path().join("real-policy.toml");
+    let symlink_path = temp_dir.path().join("policy-link.toml");
+
+    let policy = PolicyConfig::default();
+    let toml_str = toml::to_string(&policy).unwrap();
+    fs::write(&target_path, &toml_str).await.unwrap();
+    set_owner_only_permissions(&target_path);
+    symlink(&target_path, &symlink_path).unwrap();
+
+    let result = PolicyConfig::from_file(&symlink_path).await;
+    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Configuration was rejected for security reasons"
+    );
 }
 
 // ============================================================================
@@ -393,11 +465,9 @@ async fn test_malformed_toml_handling() {
         r#"version = 1
            [agent]
            instance_id = "unclosed"#,
-        
         // Invalid types
         r#"version = "not a number"
            [agent]"#,
-        
         // Circular references (TOML doesn't support, but test anyway)
         r#"[a]
            b = { c = "test" }
@@ -418,7 +488,7 @@ async fn test_malformed_toml_handling() {
         }
 
         let result = Config::from_file(&path).await;
-        
+
         // Should fail gracefully, not panic
         assert!(result.is_err());
     }
@@ -432,25 +502,25 @@ async fn test_malformed_toml_handling() {
 fn test_tag_comparison_timing_attack_resistance() {
     let tag1 = RootTag::generate().unwrap();
     let tag2 = RootTag::generate().unwrap();
-    
+
     // Hash comparison should be constant-time
     let hash1 = tag1.hash();
     let hash2 = tag2.hash();
-    
+
     // Multiple comparisons to check for timing variations
     let mut timings_equal = vec![];
     let mut timings_different = vec![];
-    
+
     for _ in 0..1000 {
         let start = std::time::Instant::now();
         let _ = hash1 == hash1;
         timings_equal.push(start.elapsed());
-        
+
         let start = std::time::Instant::now();
         let _ = hash1 == hash2;
         timings_different.push(start.elapsed());
     }
-    
+
     // This is a weak test, but we can at least verify no panics
     // A real timing attack test would require more sophisticated analysis
     assert_eq!(timings_equal.len(), 1000);
@@ -464,17 +534,17 @@ fn test_tag_comparison_timing_attack_resistance() {
 #[test]
 fn test_boundary_values_for_numeric_fields() {
     let mut policy = PolicyConfig::default();
-    
+
     // Test exact boundary values
     policy.scoring.alert_threshold = 0.0;
     assert!(policy.validate().is_ok());
-    
+
     policy.scoring.alert_threshold = 100.0;
     assert!(policy.validate().is_ok());
-    
+
     policy.scoring.alert_threshold = -0.1;
     assert!(policy.validate().is_err());
-    
+
     policy.scoring.alert_threshold = 100.1;
     assert!(policy.validate().is_err());
 }
@@ -482,17 +552,17 @@ fn test_boundary_values_for_numeric_fields() {
 #[test]
 fn test_boundary_values_for_usize_fields() {
     let mut policy = PolicyConfig::default();
-    
+
     // Max events boundary
     policy.scoring.max_events_in_memory = 1;
     assert!(policy.validate().is_ok());
-    
+
     policy.scoring.max_events_in_memory = 100_000;
     assert!(policy.validate().is_ok());
-    
+
     policy.scoring.max_events_in_memory = 100_001;
     assert!(policy.validate().is_err());
-    
+
     policy.scoring.max_events_in_memory = 0;
     assert!(policy.validate().is_err());
 }
@@ -500,16 +570,16 @@ fn test_boundary_values_for_usize_fields() {
 #[test]
 fn test_empty_collections_validation() {
     let mut config = Config::default();
-    
+
     // Empty decoy paths should fail
     config.deception.decoy_paths = Box::new([]);
     assert!(config.validate().is_err());
-    
+
     // Empty credential types should fail
     config = Config::default();
     config.deception.credential_types = Box::new([]);
     assert!(config.validate().is_err());
-    
+
     // Empty watch paths should fail
     config = Config::default();
     config.telemetry.watch_paths = Box::new([]);

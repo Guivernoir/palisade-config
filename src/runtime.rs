@@ -3,11 +3,12 @@
 //! Deserialize/serialize can allocate. After conversion to these types, hot-path
 //! operations can run without heap allocations.
 
-use crate::errors;
-use crate::timing::{enforce_operation_min_timing, TimingOperation};
+use crate::timing::{TimingOperation, enforce_operation_min_timing};
 use crate::{AgentError, Config, PolicyConfig, RootTag};
 use heapless::{String as HString, Vec as HVec};
 use std::time::Instant;
+
+const CFG_INVALID_VALUE: u16 = 103;
 
 /// Maximum bytes for path-like fields.
 pub const MAX_PATH_LEN: usize = 512;
@@ -25,12 +26,11 @@ pub const MAX_SUSPICIOUS_PATTERNS: usize = 128;
 pub const MAX_CUSTOM_CONDITIONS: usize = 128;
 
 /// Stack-only runtime configuration for no-allocation operation.
-#[derive(Clone)]
 pub struct RuntimeConfig {
     /// Effective agent hostname.
     pub hostname: HString<MAX_LABEL_LEN>,
-    /// Root tag used for derivation.
-    pub root_tag: RootTag,
+    /// Pre-derived host tag used for artifact derivation.
+    host_tag: [u8; 64],
     /// Decoy paths (UTF-8 only).
     pub decoy_paths: HVec<HString<MAX_PATH_LEN>, MAX_PATH_ENTRIES>,
     /// Watch paths (UTF-8 only).
@@ -44,7 +44,6 @@ pub struct RuntimeConfig {
 }
 
 /// Stack-only runtime policy for no-allocation operation.
-#[derive(Clone)]
 pub struct RuntimePolicy {
     /// Alert threshold.
     pub alert_threshold: f64,
@@ -57,16 +56,49 @@ pub struct RuntimePolicy {
 }
 
 impl RuntimeConfig {
+    pub(crate) fn from_parts(
+        hostname: HString<MAX_LABEL_LEN>,
+        host_tag: [u8; 64],
+        decoy_paths: HVec<HString<MAX_PATH_LEN>, MAX_PATH_ENTRIES>,
+        watch_paths: HVec<HString<MAX_PATH_LEN>, MAX_PATH_ENTRIES>,
+        credential_types: HVec<HString<MAX_LABEL_LEN>, MAX_CREDENTIAL_TYPES>,
+        honeytoken_count: usize,
+        artifact_permissions: u32,
+    ) -> Self {
+        Self {
+            hostname,
+            host_tag,
+            decoy_paths,
+            watch_paths,
+            credential_types,
+            honeytoken_count,
+            artifact_permissions,
+        }
+    }
+
     /// Derive an artifact tag hex digest into a caller-provided fixed buffer.
     ///
     /// No heap allocation occurs.
     pub fn derive_artifact_tag_hex_into(&self, artifact_id: &str, out: &mut [u8; 128]) {
-        self.root_tag
-            .derive_artifact_tag_hex_into(self.hostname.as_str(), artifact_id, out);
+        RootTag::derive_artifact_tag_hex_from_host_tag_into(&self.host_tag, artifact_id, out);
     }
 }
 
 impl RuntimePolicy {
+    pub(crate) fn from_parts(
+        alert_threshold: f64,
+        suspicious_processes: HVec<HString<MAX_LABEL_LEN>, MAX_SUSPICIOUS_PROCESSES>,
+        suspicious_patterns: HVec<HString<MAX_LABEL_LEN>, MAX_SUSPICIOUS_PATTERNS>,
+        registered_custom_conditions: HVec<HString<MAX_LABEL_LEN>, MAX_CUSTOM_CONDITIONS>,
+    ) -> Self {
+        Self {
+            alert_threshold,
+            suspicious_processes,
+            suspicious_patterns,
+            registered_custom_conditions,
+        }
+    }
+
     /// Check for suspicious process name using ASCII case-insensitive substring matching.
     ///
     /// No heap allocation occurs.
@@ -105,14 +137,16 @@ impl Config {
         let started = Instant::now();
         let result = (|| {
             let hostname = push_str::<MAX_LABEL_LEN>("agent.hostname", self.hostname().as_ref())?;
+            let host_tag = self.deception.root_tag.derive_host_tag_bytes(hostname.as_str());
 
             let mut decoy_paths = HVec::<HString<MAX_PATH_LEN>, MAX_PATH_ENTRIES>::new();
             for path in &self.deception.decoy_paths {
                 let path_str = path.to_str().ok_or_else(|| {
-                    errors::invalid_value(
-                        "to_runtime_config",
+                    AgentError::new(
+                        CFG_INVALID_VALUE,
+                        "Configuration contains an invalid value",
+                        "operation=to_runtime_config; field=deception.decoy_paths; path must be valid UTF-8 for runtime no-alloc mode",
                         "deception.decoy_paths",
-                        "path must be valid UTF-8 for runtime no-alloc mode",
                     )
                 })?;
                 push_vec_str("deception.decoy_paths", path_str, &mut decoy_paths)?;
@@ -121,10 +155,11 @@ impl Config {
             let mut watch_paths = HVec::<HString<MAX_PATH_LEN>, MAX_PATH_ENTRIES>::new();
             for path in &self.telemetry.watch_paths {
                 let path_str = path.to_str().ok_or_else(|| {
-                    errors::invalid_value(
-                        "to_runtime_config",
+                    AgentError::new(
+                        CFG_INVALID_VALUE,
+                        "Configuration contains an invalid value",
+                        "operation=to_runtime_config; field=telemetry.watch_paths; path must be valid UTF-8 for runtime no-alloc mode",
                         "telemetry.watch_paths",
-                        "path must be valid UTF-8 for runtime no-alloc mode",
                     )
                 })?;
                 push_vec_str("telemetry.watch_paths", path_str, &mut watch_paths)?;
@@ -137,7 +172,7 @@ impl Config {
 
             Ok(RuntimeConfig {
                 hostname,
-                root_tag: self.deception.root_tag.clone(),
+                host_tag,
                 decoy_paths,
                 watch_paths,
                 credential_types,
@@ -162,7 +197,11 @@ impl PolicyConfig {
             let mut suspicious_processes =
                 HVec::<HString<MAX_LABEL_LEN>, MAX_SUSPICIOUS_PROCESSES>::new();
             for p in &self.deception.suspicious_processes {
-                push_vec_str("deception.suspicious_processes", p, &mut suspicious_processes)?;
+                push_vec_str(
+                    "deception.suspicious_processes",
+                    p,
+                    &mut suspicious_processes,
+                )?;
             }
 
             let mut suspicious_patterns =
@@ -196,10 +235,13 @@ impl PolicyConfig {
 fn push_str<const N: usize>(field: &str, value: &str) -> Result<HString<N>, AgentError> {
     let mut out = HString::<N>::new();
     out.push_str(value).map_err(|_| {
-        errors::invalid_value(
-            "to_runtime",
+        AgentError::new(
+            CFG_INVALID_VALUE,
+            "Configuration contains an invalid value",
+            format!(
+                "operation=to_runtime; field={field}; value exceeds fixed no-alloc capacity ({N} bytes)"
+            ),
             field,
-            format!("value exceeds fixed no-alloc capacity ({N} bytes)"),
         )
     })?;
     Ok(out)
@@ -212,10 +254,11 @@ fn push_vec_str<const N: usize, const M: usize>(
 ) -> Result<(), AgentError> {
     let item = push_str::<N>(field, value)?;
     out.push(item).map_err(|_| {
-        errors::invalid_value(
-            "to_runtime",
+        AgentError::new(
+            CFG_INVALID_VALUE,
+            "Configuration contains an invalid value",
+            format!("operation=to_runtime; field={field}; too many entries for fixed no-alloc capacity ({M})"),
             field,
-            format!("too many entries for fixed no-alloc capacity ({M})"),
         )
     })?;
     Ok(())
@@ -255,7 +298,9 @@ mod tests {
     #[test]
     fn config_to_runtime_works() {
         let config = Config::default();
-        let rt = config.to_runtime().expect("runtime conversion must succeed");
+        let rt = config
+            .to_runtime()
+            .expect("runtime conversion must succeed");
         let mut out = [0u8; 128];
         rt.derive_artifact_tag_hex_into("artifact", &mut out);
         assert!(out[0].is_ascii_hexdigit());
@@ -264,7 +309,9 @@ mod tests {
     #[test]
     fn policy_to_runtime_works() {
         let policy = PolicyConfig::default();
-        let rt = policy.to_runtime().expect("runtime conversion must succeed");
+        let rt = policy
+            .to_runtime()
+            .expect("runtime conversion must succeed");
         assert!(rt.is_suspicious_process("MIMIKATZ.exe"));
         assert!(!rt.is_suspicious_process("notepad.exe"));
     }

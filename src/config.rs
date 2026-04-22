@@ -7,17 +7,27 @@
 //!
 //! This does NOT define decision-making (see [`crate::policy`]).
 
-use crate::defaults::{default_version, default_honeytoken_count, default_artifact_permissions, default_event_buffer_size, default_log_format, default_rotate_size, default_max_log_files, default_log_level};
-use crate::errors::{self, UnixPermissionError, PathValidationError, CollectionValidationError, RangeValidationError};
+use crate::defaults::{
+    default_artifact_permissions, default_event_buffer_size, default_honeytoken_count,
+    default_log_format, default_log_level, default_max_log_files, default_rotate_size,
+    default_version,
+};
+use crate::secure_fs::{RestrictedInputKind, read_restricted_file};
 use crate::tags::RootTag;
-use crate::timing::{enforce_operation_min_timing, TimingOperation};
+use crate::timing::{TimingOperation, enforce_operation_min_timing};
 use crate::validation::ValidationMode;
-use crate::CONFIG_VERSION;
-use palisade_errors::Result;
-use serde::{Deserialize, Serialize};
+use crate::{AgentError, CONFIG_VERSION, Result};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+const CFG_PARSE_FAILED: u16 = 100;
+const CFG_VALIDATION_FAILED: u16 = 101;
+const CFG_MISSING_REQUIRED: u16 = 102;
+const CFG_INVALID_VALUE: u16 = 103;
+const CFG_VERSION_MISMATCH: u16 = 106;
+const IO_WRITE_FAILED: u16 = 801;
 
 /// Master configuration - the MECHANICS of your deception operation.
 #[derive(Debug, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -43,11 +53,17 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct AgentConfig {
     /// Unique instance identifier (for correlation)
-    #[serde(skip, default)]
+    #[serde(
+        serialize_with = "serialize_protected_string",
+        deserialize_with = "deserialize_protected_string"
+    )]
     pub instance_id: ProtectedString,
 
     /// Working directory for agent state
-    #[serde(skip, default)]
+    #[serde(
+        serialize_with = "serialize_protected_path",
+        deserialize_with = "deserialize_protected_path"
+    )]
     pub work_dir: ProtectedPath,
 
     /// Optional environment label (dev, staging, prod)
@@ -57,12 +73,6 @@ pub struct AgentConfig {
     /// Hostname for tag derivation (defaults to system hostname)
     #[serde(default)]
     pub hostname: Option<String>,
-
-    // Serialization helpers (convert on load/save)
-    #[serde(rename = "instance_id")]
-    instance_id_raw: String,
-    #[serde(rename = "work_dir")]
-    work_dir_raw: String,
 }
 
 /// Deception artifact configuration.
@@ -90,7 +100,9 @@ pub struct DeceptionConfig {
 }
 
 /// Deserialize Vec<String> to Box<[String]> for memory efficiency.
-fn deserialize_boxed_strings<'de, D>(deserializer: D) -> std::result::Result<Box<[String]>, D::Error>
+fn deserialize_boxed_strings<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Box<[String]>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -172,24 +184,42 @@ pub struct ProtectedString {
 impl ProtectedString {
     /// Create from string (takes ownership).
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn new(s: String) -> Self {
         Self { inner: s }
     }
 
     /// Access the inner string by reference.
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.inner
     }
 
     /// Consume and return inner string.
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn into_inner(mut self) -> String {
         std::mem::take(&mut self.inner)
     }
+}
+
+fn serialize_protected_string<S>(
+    value: &ProtectedString,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(value.as_str())
+}
+
+fn deserialize_protected_string<'de, D>(deserializer: D) -> std::result::Result<ProtectedString, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Ok(ProtectedString::new(value))
 }
 
 impl std::fmt::Debug for ProtectedString {
@@ -208,24 +238,42 @@ pub struct ProtectedPath {
 impl ProtectedPath {
     /// Create from `PathBuf` (takes ownership).
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self { inner: path }
     }
 
     /// Access the inner path by reference.
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.inner
     }
 
     /// Consume and return inner `PathBuf`.
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn into_inner(mut self) -> PathBuf {
         std::mem::replace(&mut self.inner, PathBuf::new())
     }
+}
+
+fn serialize_protected_path<S>(
+    value: &ProtectedPath,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.as_path().to_string_lossy())
+}
+
+fn deserialize_protected_path<'de, D>(deserializer: D) -> std::result::Result<ProtectedPath, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Ok(ProtectedPath::new(PathBuf::from(value)))
 }
 
 impl std::fmt::Debug for ProtectedPath {
@@ -241,7 +289,7 @@ impl Config {
     ///
     /// Returns error if file cannot be read, TOML is invalid, or validation fails.
     pub async fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::from_file_with_mode(path, ValidationMode::Standard).await
+        Self::from_file_with_mode(path, &ValidationMode::Standard).await
     }
 
     /// Load configuration with specific validation mode (async to prevent thread exhaustion).
@@ -249,60 +297,60 @@ impl Config {
     /// # Errors
     ///
     /// Returns error if file cannot be read, TOML is invalid, or validation fails.
-    pub async fn from_file_with_mode<P: AsRef<Path>>(path: P, mode: ValidationMode) -> Result<Self> {
+    pub async fn from_file_with_mode<P: AsRef<Path>>(
+        path: P,
+        mode: &ValidationMode,
+    ) -> Result<Self> {
         let started = Instant::now();
         let path = path.as_ref();
         let result = async {
-            // Platform-aware permission validation
-            Self::validate_file_permissions(path)?;
-
-            let contents = tokio::fs::read_to_string(path)
-                .await
-                .map_err(|e| errors::io_read_error("load_config", path, e))?;
-
-            let mut config: Config = toml::from_str(&contents).map_err(|e| {
-                let location = e
-                    .span().map_or_else(|| "unknown location".to_string(), |s| format!("line {}", contents[..s.start].matches('\n').count() + 1));
-
-                errors::parse_error(
-                    "parse_config_toml",
-                    format!("Invalid TOML syntax at {location}: {e}"),
-                )
-            })?;
-
-            // Convert raw fields to protected types
-            config.agent.instance_id =
-                ProtectedString::new(std::mem::take(&mut config.agent.instance_id_raw));
-            config.agent.work_dir =
-                ProtectedPath::new(PathBuf::from(std::mem::take(&mut config.agent.work_dir_raw)));
-
-            // Version validation
-            if config.version != CONFIG_VERSION {
-                let message = if config.version > CONFIG_VERSION {
-                    "Configuration version too new - upgrade agent"
-                } else {
-                    "Configuration version outdated - update config"
-                };
-
-                return Err(errors::version_error(
-                    "validate_config_version",
-                    config.version,
-                    CONFIG_VERSION,
-                    message,
-                ));
-            }
-
-            config.validate_with_mode(mode)?;
-
-            Ok(config)
+            let contents = read_restricted_file(path, RestrictedInputKind::Config).await?;
+            Self::from_toml_str_with_mode(&contents, mode)
         }
         .await;
         enforce_operation_min_timing(started, TimingOperation::ConfigLoad);
         result
     }
 
+    pub(crate) fn from_toml_str_with_mode(contents: &str, mode: &ValidationMode) -> Result<Self> {
+        let config: Config = toml::from_str(contents).map_err(|e| {
+            let location = e.span().map_or_else(
+                || "unknown location".to_string(),
+                |s| format!("line {}", contents[..s.start].matches('\n').count() + 1),
+            );
+
+            AgentError::new(
+                CFG_PARSE_FAILED,
+                "Configuration input could not be parsed",
+                format!("operation=parse_config_toml; Invalid TOML syntax at {location}: {e}"),
+                "",
+            )
+        })?;
+
+        if config.version != CONFIG_VERSION {
+            let message = if config.version > CONFIG_VERSION {
+                "Configuration version too new - upgrade agent"
+            } else {
+                "Configuration version outdated - update config"
+            };
+
+            return Err(AgentError::new(
+                CFG_VERSION_MISMATCH,
+                "Configuration version is not supported",
+                format!(
+                    "operation=validate_config_version; {message}; file_version={}; expected_version={CONFIG_VERSION}",
+                    config.version
+                ),
+                "",
+            ));
+        }
+
+        config.validate_with_mode(mode)?;
+        Ok(config)
+    }
+
     /// Validate configuration with specific mode.
-    fn validate_with_mode(&self, mode: ValidationMode) -> Result<()> {
+    pub(crate) fn validate_with_mode(&self, mode: &ValidationMode) -> Result<()> {
         let started = Instant::now();
         let result = (|| {
             self.validate_agent()?;
@@ -314,8 +362,8 @@ impl Config {
         enforce_operation_min_timing(
             started,
             match mode {
-                ValidationMode::Standard => TimingOperation::ConfigValidateStandard,
-                ValidationMode::Strict => TimingOperation::ConfigValidateStrict,
+                &ValidationMode::Standard => TimingOperation::ConfigValidateStandard,
+                &ValidationMode::Strict => TimingOperation::ConfigValidateStrict,
             },
         );
         result
@@ -323,185 +371,205 @@ impl Config {
 
     /// Validate configuration (standard mode).
     pub fn validate(&self) -> Result<()> {
-        self.validate_with_mode(ValidationMode::Standard)
-    }
-
-    #[cfg(unix)]
-    fn validate_file_permissions(path: &Path) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| errors::io_metadata_error("validate_config_file", path, e))?;
-
-        let mode = metadata.permissions().mode();
-
-        // Config file MUST NOT be world-readable or group-writable
-        if (mode & 0o077) != 0 {
-            return Err(UnixPermissionError::insecure_permissions(mode, "0o600"));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn validate_file_permissions(_path: &Path) -> Result<()> {
-        // Windows: Rely on NTFS ACLs (validated externally)
-        Ok(())
+        self.validate_with_mode(&ValidationMode::Standard)
     }
 
     fn validate_agent(&self) -> Result<()> {
         if self.agent.instance_id.as_str().is_empty() {
-            return Err(errors::missing_required(
-                "validate_agent",
+            return Err(AgentError::new(
+                CFG_MISSING_REQUIRED,
+                "Required configuration is missing",
+                "operation=validate_agent; agent.instance_id cannot be empty; impact=no_telemetry_correlation",
                 "agent.instance_id",
-                "no_telemetry_correlation",
             ));
         }
 
         if !self.agent.work_dir.as_path().is_absolute() {
-            return Err(PathValidationError::not_absolute(
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                "operation=validate_agent; field=agent.work_dir; agent.work_dir must be an absolute path",
                 "agent.work_dir",
-                "validate_agent",
             ));
         }
 
         Ok(())
     }
 
-    fn validate_deception(&self, mode: ValidationMode) -> Result<()> {
+    fn validate_deception(&self, mode: &ValidationMode) -> Result<()> {
         if self.deception.decoy_paths.is_empty() {
-            return Err(CollectionValidationError::empty(
+            return Err(AgentError::new(
+                CFG_MISSING_REQUIRED,
+                "Required configuration is missing",
+                "operation=validate_deception; deception.decoy_paths cannot be empty; impact=no_deception",
                 "deception.decoy_paths",
-                "no_deception",
-                "validate_deception",
             ));
         }
 
         for (idx, path) in self.deception.decoy_paths.iter().enumerate() {
             if !path.is_absolute() {
-                return Err(PathValidationError::not_absolute(
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    "operation=validate_deception; field=deception.decoy_paths; deception.decoy_paths must be an absolute path",
                     "deception.decoy_paths",
-                    "validate_deception",
                 ));
             }
 
-            if mode == ValidationMode::Strict
+            if matches!(mode, ValidationMode::Strict)
                 && let Some(parent) = path.parent()
-                    && !parent.exists() {
-                        return Err(PathValidationError::parent_missing(
-                            "deception.decoy_paths",
-                            Some(idx),
-                            "validate_deception",
-                        ));
-                    }
+                && !parent.exists()
+            {
+                return Err(AgentError::new(
+                    CFG_VALIDATION_FAILED,
+                    "Configuration validation failed",
+                    format!(
+                        "operation=validate_deception; deception.decoy_paths parent directory does not exist; path_index={idx}"
+                    ),
+                    "deception.decoy_paths",
+                ));
+            }
         }
 
         if self.deception.credential_types.is_empty() {
-            return Err(CollectionValidationError::empty(
+            return Err(AgentError::new(
+                CFG_MISSING_REQUIRED,
+                "Required configuration is missing",
+                "operation=validate_deception; deception.credential_types cannot be empty; impact=no_credential_types",
                 "deception.credential_types",
-                "no_credential_types",
-                "validate_deception",
             ));
         }
 
         if self.deception.honeytoken_count == 0 || self.deception.honeytoken_count > 100 {
-            return Err(RangeValidationError::out_of_range(
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                format!(
+                    "operation=validate_deception; field=deception.honeytoken_count; reason=deception.honeytoken_count must be within valid range; actual_value={}; expected_range=1-100",
+                    self.deception.honeytoken_count
+                ),
                 "deception.honeytoken_count",
-                self.deception.honeytoken_count,
-                1,
-                100,
-                "validate_deception",
             ));
         }
 
         if self.deception.artifact_permissions > 0o777 {
-            return Err(RangeValidationError::above_maximum(
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                format!(
+                    "operation=validate_deception; field=deception.artifact_permissions; reason=deception.artifact_permissions exceeds maximum threshold; actual_value={:o}; expected_range=maximum: 0o777",
+                    self.deception.artifact_permissions
+                ),
                 "deception.artifact_permissions",
-                format!("{:o}", self.deception.artifact_permissions),
-                "0o777".to_string(),
-                "validate_deception",
             ));
         }
 
         Ok(())
     }
 
-    fn validate_telemetry(&self, mode: ValidationMode) -> Result<()> {
+    fn validate_telemetry(&self, mode: &ValidationMode) -> Result<()> {
         if self.telemetry.watch_paths.is_empty() {
-            return Err(CollectionValidationError::empty(
+            return Err(AgentError::new(
+                CFG_MISSING_REQUIRED,
+                "Required configuration is missing",
+                "operation=validate_telemetry; telemetry.watch_paths cannot be empty; impact=no_monitoring",
                 "telemetry.watch_paths",
-                "no_monitoring",
-                "validate_telemetry",
             ));
         }
 
         for (idx, path) in self.telemetry.watch_paths.iter().enumerate() {
             if !path.is_absolute() {
-                return Err(PathValidationError::not_absolute(
+                return Err(AgentError::new(
+                    CFG_INVALID_VALUE,
+                    "Configuration contains an invalid value",
+                    "operation=validate_telemetry; field=telemetry.watch_paths; telemetry.watch_paths must be an absolute path",
                     "telemetry.watch_paths",
-                    "validate_telemetry",
                 ));
             }
 
-            if mode == ValidationMode::Strict && !path.exists() {
-                return Err(PathValidationError::not_found(
+            if matches!(mode, ValidationMode::Strict) && !path.exists() {
+                return Err(AgentError::new(
+                    CFG_VALIDATION_FAILED,
+                    "Configuration validation failed",
+                    format!(
+                        "operation=validate_telemetry; telemetry.watch_paths does not exist; path_index={idx}"
+                    ),
                     "telemetry.watch_paths",
-                    Some(idx),
-                    "validate_telemetry",
                 ));
             }
         }
 
         if self.telemetry.event_buffer_size < 100 {
-            return Err(RangeValidationError::below_minimum(
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                format!(
+                    "operation=validate_telemetry; field=telemetry.event_buffer_size; reason=telemetry.event_buffer_size below minimum threshold; actual_value={}; expected_range=minimum: 100",
+                    self.telemetry.event_buffer_size
+                ),
                 "telemetry.event_buffer_size",
-                self.telemetry.event_buffer_size,
-                100,
-                "validate_telemetry",
             ));
         }
 
         Ok(())
     }
 
-    fn validate_logging(&self, mode: ValidationMode) -> Result<()> {
+    fn validate_logging(&self, mode: &ValidationMode) -> Result<()> {
         if !self.logging.log_path.is_absolute() {
-            return Err(PathValidationError::not_absolute(
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                "operation=validate_logging; field=logging.log_path; logging.log_path must be an absolute path",
                 "logging.log_path",
-                "validate_logging",
             ));
         }
 
-        if mode == ValidationMode::Strict
-            && let Some(parent) = self.logging.log_path.parent() {
-                if !parent.exists() {
-                    return Err(PathValidationError::parent_missing(
-                        "logging.log_path",
-                        None,
-                        "validate_logging",
-                    ));
-                }
-
-                let test_file = parent.join(".palisade-write-test");
-                std::fs::write(&test_file, b"test")
-                    .map_err(|e| errors::io_write_error("test_log_directory_write", &test_file, e))?;
-                let _ = std::fs::remove_file(&test_file);
+        if matches!(mode, ValidationMode::Strict)
+            && let Some(parent) = self.logging.log_path.parent()
+        {
+            if !parent.exists() {
+                return Err(AgentError::new(
+                    CFG_VALIDATION_FAILED,
+                    "Configuration validation failed",
+                    "operation=validate_logging; logging.log_path parent directory does not exist",
+                    "logging.log_path",
+                ));
             }
 
+            let test_file = parent.join(".palisade-write-test");
+            std::fs::write(&test_file, b"test").map_err(|e| {
+                AgentError::new(
+                    IO_WRITE_FAILED,
+                    "Configuration output could not be written",
+                    format!(
+                        "operation=test_log_directory_write; io_kind={}; write failed",
+                        e.kind()
+                    ),
+                    test_file.display().to_string(),
+                )
+            })?;
+            let _ = std::fs::remove_file(&test_file);
+        }
+
         if self.logging.rotate_size_bytes < 1024 * 1024 {
-            return Err(RangeValidationError::below_minimum(
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                format!(
+                    "operation=validate_logging; field=logging.rotate_size_bytes; reason=logging.rotate_size_bytes below minimum threshold; actual_value={}; expected_range=minimum: {}",
+                    self.logging.rotate_size_bytes,
+                    1024 * 1024
+                ),
                 "logging.rotate_size_bytes",
-                self.logging.rotate_size_bytes,
-                1024 * 1024,
-                "validate_logging",
             ));
         }
 
         if self.logging.max_log_files == 0 {
-            return Err(errors::invalid_value(
-                "validate_logging",
+            return Err(AgentError::new(
+                CFG_INVALID_VALUE,
+                "Configuration contains an invalid value",
+                "operation=validate_logging; field=logging.max_log_files; logging.max_log_files cannot be zero",
                 "logging.max_log_files",
-                "logging.max_log_files cannot be zero",
             ));
         }
 
@@ -512,7 +580,9 @@ impl Config {
     #[must_use]
     pub fn hostname(&self) -> std::borrow::Cow<'_, str> {
         let started = Instant::now();
-        let hostname = if let Some(h) = &self.agent.hostname { std::borrow::Cow::Borrowed(h.as_str()) } else {
+        let hostname = if let Some(h) = &self.agent.hostname {
+            std::borrow::Cow::Borrowed(h.as_str())
+        } else {
             // Only allocate if we need to fetch system hostname
             let system_hostname = hostname::get()
                 .ok()
@@ -527,7 +597,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let default_instance_id = hostname::get()
+        let mut default_instance_id = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -535,12 +605,10 @@ impl Default for Config {
         Self {
             version: CONFIG_VERSION,
             agent: AgentConfig {
-                instance_id: ProtectedString::new(default_instance_id.clone()),
+                instance_id: ProtectedString::new(std::mem::take(&mut default_instance_id)),
                 work_dir: ProtectedPath::new(PathBuf::from("/var/lib/palisade-agent")),
                 environment: None,
                 hostname: None,
-                instance_id_raw: default_instance_id,
-                work_dir_raw: "/var/lib/palisade-agent".to_string(),
             },
             deception: DeceptionConfig {
                 decoy_paths: vec![
@@ -550,7 +618,8 @@ impl Default for Config {
                 .into_boxed_slice(),
                 credential_types: vec!["aws".to_string(), "ssh".to_string()].into_boxed_slice(),
                 honeytoken_count: 5,
-                root_tag: RootTag::generate().expect("Failed to generate root tag - system entropy failure"),
+                root_tag: RootTag::generate()
+                    .expect("Failed to generate root tag - system entropy failure"),
                 artifact_permissions: 0o600,
             },
             telemetry: TelemetryConfig {
@@ -611,7 +680,7 @@ mod tests {
         assert!(result.is_err());
 
         if let Err(err) = result {
-            assert!(err.to_string().contains("Configuration"));
+            assert_eq!(err.to_string(), "Required configuration is missing");
         }
     }
 
